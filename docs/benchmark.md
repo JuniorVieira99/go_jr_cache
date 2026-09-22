@@ -2,7 +2,10 @@
 
 Full run of the `tests/bench` suite: every module, every basic operation
 (populate, get, has, set, update, pop, delete) plus each module's own
-operations, at 500 / 1,000 / 5,000 / 10,000 / 50,000 entries. All rows come
+operations, at 500 / 1,000 / 5,000 / 10,000 / 50,000 entries. The
+`GCManager` benchmarks run a different workload at different sizes, so they
+have their own section ([Turning the collector off](#turning-the-collector-off))
+and are not in the per-module tables below. All rows come
 from one session on an idle machine; a previous session on the same
 machine measured ~30–40 % slower across unchanged code, so compare rows
 within this report rather than against older copies of it.
@@ -84,10 +87,58 @@ table: `OrderedMap/Populate` is 22–41 ns/entry and 32 B/entry (one node).
 `time.Now()`), a `Get` on a key with a TTL adds ~6–14 ns for the deadline
 check, and `DeleteExpired` sweeps at 30–60 ns/entry.
 
+## Turning the collector off
+
+`GCManager.DisableGCCompletely` turns Go's collector off for the whole
+process. `BenchmarkGCEnabledVsDisabled` measures whether that is worth it:
+the same cache-churn workload (256-byte values, every iteration allocates
+one and evicts another) with the collector on and off, at 10,000 and
+100,000 entries. `-benchtime=200ms`, three runs each.
+
+| Capacity | Collector | ns/op (3 runs) | GC cycles | Pause total | Heap at the end |
+|---|---|---:|---:|---:|---:|
+| 10,000 | on | 192 / 190 / 189 | ~89 | 4–10 ms | 5–7 MB |
+| 10,000 | **off** | 224 / 180 / 156 | 0 | 0 | **293–451 MB** |
+| 100,000 | on | 188 / 195 / 205 | ~11 | 0–0.5 ms | 41–68 MB |
+| 100,000 | **off** | 227 / 162 / 141 | 0 | 0 | **410–536 MB** |
+
+Turning the collector off is **not reliably faster**. The steady-state gain
+is at best ~10–25 % once the heap has finished growing, the first run is
+*slower* than leaving the collector on (the allocator is faulting in new
+pages instead of reusing swept ones), and the spread across runs
+(141–227 ns) dwarfs the difference. What it does buy is the pause column:
+exactly zero, against 4–10 ms per 200 ms of work at 10,000 entries. That is
+the real reason to use it — a bounded latency-critical section — and it
+costs hundreds of megabytes of heap that are never given back.
+
+`BenchmarkGCPercent` shows the middle lever, which is the better one for
+almost every case: raising `GOGC` rather than switching the collector off.
+
+| GOGC | ns/op | GC cycles | Heap at the end |
+|---|---:|---:|---:|
+| 100 (default) | 161 / 153 | 18–20 | 56–61 MB |
+| 400 | 137 / 137 | 5–6 | 103–130 MB |
+| 800 | 149 / 170 | 2 | 130–178 MB |
+
+`GOGC=400` gets most of the available speed-up for a bounded heap, and
+unlike disabling the collector it keeps the program's memory use finite.
+
+`BenchmarkSweeperOverhead` measures the manager's own background sweep on a
+cache with no TTLs, where every sweep finds nothing: 193–226 ns/op with no
+sweeper, 218–220 ns/op sweeping every millisecond, 218–223 ns/op every
+100 ms. At any sane interval the sweeper is lost in the noise.
+
 ## Reproducing
 
 ```
 go test ./tests/bench -run xxx -bench . -benchmem -benchtime=500ms
+```
+
+The GC benchmarks want a short run — with the collector off nothing is
+reclaimed, so a long one just grows the heap:
+
+```
+go test ./tests/bench -run xxx -bench 'GCEnabledVsDisabled|GCPercent|SweeperOverhead' -benchtime=200ms
 ```
 
 This report was produced at `-benchtime=500ms`, one chunk per top-level
@@ -104,9 +155,9 @@ report was generated from is in `benchmark_raw.txt` next to it.
 - go version go1.26.2 windows/amd64
 - OS/arch: windows/amd64
 - CPU: Intel(R) Core(TM) Ultra 9 275HX
-- Command: `go test ./tests/bench -run xxx -bench . -benchmem`
+- Command: `go test ./tests/bench -run xxx -bench . -benchmem` (GC section: `-benchtime=200ms`)
 - Entry counts: 500, 1,000, 5,000, 10,000, 50,000
-- Benchmarks run: 835
+- Benchmarks run: 845 (835 in the per-module tables, 10 in the GC section)
 
 ## How to read the tables
 
@@ -115,6 +166,7 @@ report was generated from is in `benchmark_raw.txt` next to it.
 - `B/op` and `allocs/op` are taken at the largest entry count.
 - `Parallel` rows run a 3:1 Get/Set mix from `GOMAXPROCS` goroutines via `b.RunParallel`; the number is wall-clock ns per operation across all goroutines, so lower means better scaling, not less CPU work.
 - Modules suffixed `Locked` take their mutex on every call; the plain variant does not.
+- The GC section reports its own metrics instead — `GCs`, `pause-ms` and `heap-MB` — since what matters there is what the collector did, not just the per-operation cost.
 
 ## Results
 
@@ -122,15 +174,15 @@ report was generated from is in `benchmark_raw.txt` next to it.
 - [OrderedMapLocked](#orderedmaplocked)
 - [BucketMap](#bucketmap)
 - [BucketMapLocked](#bucketmaplocked)
-- [CacheMap — LRU](#cachemap-lru)
-- [CacheMap — LFU](#cachemap-lfu)
-- [CacheMapLocked — LRU](#cachemaplocked-lru)
-- [CacheMapLocked — LFU](#cachemaplocked-lfu)
-- [ShardedCacheMap — LRU](#shardedcachemap-lru)
-- [ShardedCacheMap — LFU](#shardedcachemap-lfu)
+- [CacheMap — LRU](#cachemap--lru)
+- [CacheMap — LFU](#cachemap--lfu)
+- [CacheMapLocked — LRU](#cachemaplocked--lru)
+- [CacheMapLocked — LFU](#cachemaplocked--lfu)
+- [ShardedCacheMap — LRU](#shardedcachemap--lru)
+- [ShardedCacheMap — LFU](#shardedcachemap--lfu)
 - [ShardedMap](#shardedmap)
-- [ShardedCacheMapGlobal — LRU](#shardedcachemapglobal-lru)
-- [ShardedCacheMapGlobal — LFU](#shardedcachemapglobal-lfu)
+- [ShardedCacheMapGlobal — LRU](#shardedcachemapglobal--lru)
+- [ShardedCacheMapGlobal — LFU](#shardedcachemapglobal--lfu)
 
 ### OrderedMap
 

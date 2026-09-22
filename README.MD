@@ -4,7 +4,7 @@ Generic, in-memory caching primitives for Go: an ordered map, a frequency
 bucket map, a bounded cache with six eviction policies and per-entry TTLs,
 and sharded variants of both the map and the cache — all sharing one API.
 
-![Go](https://img.shields.io/badge/go-1.26-00ADD8?logo=go) ![Generics](https://img.shields.io/badge/generics-yes-success) ![Dependencies](https://img.shields.io/badge/dependencies-none-success)
+![Go](https://img.shields.io/badge/go-1.26-00ADD8?logo=go) ![Generics](https://img.shields.io/badge/generics-yes-success) ![Dependencies](https://img.shields.io/badge/dependencies-none-success) ![License](https://img.shields.io/badge/license-MIT-blue)
 
 ## Index
 
@@ -19,6 +19,7 @@ and sharded variants of both the map and the cache — all sharing one API.
   - [`ShardedMap`](#shardedmap)
   - [`OrderedMap`](#orderedmap)
   - [`BucketMap`](#bucketmap)
+  - [`GCManager`](#gcmanager)
 - [Eviction policies](#eviction-policies)
 - [TTL semantics](#ttl-semantics)
 - [Concurrency](#concurrency)
@@ -44,6 +45,7 @@ need:
 | A concurrent map with no eviction | `ShardedMap` |
 | An insertion-ordered map with O(1) move-to-front / move-to-back | `OrderedMap` |
 | Keys grouped by a counter (frequency, priority, generation) | `BucketMap` |
+| A background sweeper on a timer, memory or date trigger | `GCManager` |
 
 Every structure exposes the same method names — `Get`, `Set`, `Has`,
 `Update`, `Pop`, `Delete`, `Top`, `Bottom`, `PopTop`, `PopBottom`, `Len`,
@@ -68,11 +70,16 @@ Every structure exposes the same method names — `Get`, `Set`, `Has`,
   shards for maximum scaling.
 - **Eviction hook** (`SetOnEvict`) called with the key and value of every
   entry the cache evicts or expires on its own.
+- **Background sweeper** (`GCManager`) that collects on an interval, a
+  memory threshold, an elapsed-time threshold or a one-shot date — and
+  works on anything, not only these caches. It can also switch Go's own
+  collector off and back on for a bounded latency-critical section.
 - **Atomic read-modify-write** on the sharded map (`Modify`) and bulk
   `Populate` that fills each shard under a single lock.
 - **Zero dependencies** outside the standard library.
 - **Compile-time interface checks** on every type, and a benchmark suite
-  covering every operation at 500 → 50,000 entries.
+  covering every operation at 500 → 50,000 entries, plus a
+  [comparison against nine other Go caches](docs/comparison.md).
 
 ## Installation
 
@@ -286,6 +293,70 @@ Buckets are pooled: emptied buckets are kept for reuse (`DefaultWarmBuckets`
 = 16, grow it with `WarmUp`), so moving a key between buckets does not
 allocate a bucket.
 
+### `GCManager`
+
+Expiry in `CacheMap` is lazy, so entries nobody touches keep their slot
+until they are evicted or swept. `GCManager` runs that sweep on a
+background goroutine:
+
+```go
+gc, err := jr_cache.NewCacheGCManager(cache, jr_cache.GCConfig{
+	Interval:        30 * time.Second, // how often to check
+	TimeThreshold:   5 * time.Minute,  // ...but collect at most this often
+	MemoryThreshold: 512 << 20,        // or as soon as the heap passes 512 MB
+	// DateThreshold: t,               // or once, at a given instant
+})
+if err != nil {
+	panic(err)
+}
+gc.Start()
+defer gc.Stop()      // ends the goroutine and waits for it
+
+n := gc.GCCollect()  // sweep right now, whatever the triggers say
+stats := gc.Stats()  // Collections, Released, LastRun, Running
+```
+
+On each tick the manager collects if **any** enabled trigger fires; a zero
+value disables that trigger, and with none set it collects every tick. The
+date trigger fires once (`DateThresholdFired` reports it, `SetDateThreshold`
+re-arms it). Every setter is safe while running — `SetInterval` resets the
+running ticker.
+
+`DisableGCCompletely` stops the sweeper **and** turns Go's own collector off
+(`SetGCPercent(-1)` plus a `math.MaxInt64` memory limit, since a memory limit
+triggers collections on its own). It returns the previous settings, and the
+manager remembers them:
+
+```go
+percent, limit := gc.DisableGCCompletely()
+defer gc.RestoreGC()                       // or gc.EnableGCCompletely(percent, limit)
+// ... latency-critical section with no GC pauses ...
+```
+
+Read the warnings before reaching for it: these are **process-global**
+runtime settings, so a library must not flip them on a caller's behalf, and
+with the collector off **nothing is ever reclaimed** — the heap only grows.
+It is for a bounded piece of work, not a mode to run in. `GCDisabled()`
+reports the state; a second `DisableGCCompletely` is a no-op that returns the
+same saved settings rather than saving "already off" over them; and
+`EnableGCCompletely` restarts the sweeper only if it was running when the
+collector was turned off.
+
+Whether it is worth it is measured in
+[docs/benchmark.md](docs/benchmark.md#turning-the-collector-off): on a
+cache-churn workload it is roughly a wash — around 10 % faster at best,
+sometimes slower — for hundreds of megabytes of heap. Raising `GOGC` is the
+better lever.
+
+It is not cache-specific: `NewGCManager(object, collect, config)` takes any
+object and any `func(Object) int` that performs one collection and returns
+how many items it released, so the same timer/memory/date logic drives a
+connection pool, a temp-file directory or anything else. `NewCacheGCManager`
+and `NewShardedCacheGCManager` are thin wrappers that pass `DeleteExpired`.
+The collect function runs **without** the manager's lock, so it may call
+back into the manager — but calling `Stop` from inside it is a caller
+error.
+
 ## Eviction policies
 
 | Policy | Evicts | Access (`Get`, `Set` on existing key, `SetOrGet` hit) | Backed by |
@@ -335,26 +406,32 @@ n := cache.DeleteExpired()           // sweep; returns how many were removed
 ## Comparison with other libraries
 
 Feature comparison against commonly used Go caches, taken from each
-project's documentation at the time of writing. Only `jr_cache` was
-benchmarked for this document; the others are not ranked on speed here.
+project's documentation. **[docs/comparison.md](docs/comparison.md)** has
+the full picture: the same libraries driven through one harness for hit
+ratio and throughput, plus a 15-row feature matrix.
 
 | Library | Eviction policies | Bounded by | TTL | Sharded | Generics | Ordered access (`Top`/`Bottom`) | Building blocks exposed |
 |---|---|---|---|---|---|---|---|
 | **jr_cache** | LRU, MRU, FIFO, LIFO, LFU, MFU | entry count | per entry, lazy | optional (`ShardedCacheMap`) | yes | yes | yes (ordered map, bucket map, sharded map) |
 | hashicorp/golang-lru v2 | LRU, 2Q, ARC | entry count | via `expirable` package | no | yes | oldest / peek | no |
 | dgraph-io/ristretto | TinyLFU admission + sampled LFU | cost | per entry | internal | yes (v2) | no | no |
-| maypok86/otter | S3-FIFO | cost | per entry | internal | yes | no | no |
+| maypok86/otter v2 | adaptive W-TinyLFU | entries or weight | per entry | internal | yes | no | no |
 | bluele/gcache | LRU, LFU, ARC, simple | entry count | per entry | no | no (`interface{}`) | no | no |
 | patrickmn/go-cache | none (TTL only) | unbounded | per entry + janitor | no | no (`interface{}`) | no | no |
 | allegro/bigcache | oldest-first within a life window | bytes | global window | yes | no (`[]byte`) | no | no |
 | orcaman/concurrent-map | none | unbounded | no | yes | yes (v2) | no | — (it *is* the block) |
 
-Where `jr_cache` fits: choose it when you want a **choice of policy** in one
-API, need **ordered access** to the least/most end, or want the
-**underlying structures** (ordered map, bucket map, sharded map) as
-first-class types. Choose ristretto or otter when raw hit-rate under a
-byte budget is the only concern; bigcache when you must keep hundreds of
-millions of entries out of the GC's sight.
+Where `jr_cache` fits, measured: single-threaded its LRU is as fast as
+hashicorp/golang-lru and ahead of every other bounded cache; under
+contention its sharded LRU beats every mutex-based cache, but the
+lock-free readers (otter, theine, ristretto) serve parallel hits 10–30×
+faster because a `jr_cache` `Get` takes a write lock to record the
+access. Its exact LFU matches W-TinyLFU hit ratios within a point at
+3–5× the cost. Choose it for a **choice of policy** in one API, **ordered
+access** to the least/most end, or the **underlying structures** as
+first-class types; choose otter/theine when many goroutines hammer one
+hot cache; bigcache/freecache to keep hundreds of millions of entries out
+of the GC's sight.
 
 ## Benchmarks
 
@@ -408,6 +485,8 @@ Run them yourself:
 ```
 go test ./tests/bench -bench . -benchmem -benchtime=500ms          # all
 go test ./tests/bench -bench 'BenchmarkCacheMap/LRU/Get/'           # one op, all sizes
+cd tests/compare && go test -run xxx -bench . -benchmem             # against other libraries
+cd tests/compare && go test -run HitRatio -v                        # eviction-policy hit ratios
 ```
 
 ## Design notes and caveats
@@ -443,14 +522,16 @@ go test ./tests/bench -bench 'BenchmarkCacheMap/LRU/Get/'           # one op, al
 ## Testing
 
 ```
-go test ./...                 # 69 tests, ~1.4 s
+go test ./...                 # 94 tests, ~2 s
 go vet ./... && gofmt -l .    # both clean
 ```
 
 Tests live in `tests/` as an external package and cover every public
 method, the eviction order of each policy, TTL edge cases, bucket pooling,
-5,000-operation randomised invariant checks on the bucket map, and
-goroutine hammering of every locked structure. The race detector is worth
+5,000-operation randomised invariant checks on the bucket map, goroutine
+hammering of every locked structure, and the `GCManager` — its triggers,
+start/stop lifecycle, goroutine-leak freedom, and the disable/restore round
+trip (which puts the process GC settings back even when a test fails). The race detector is worth
 running where a C toolchain is available: `go test -race ./...`.
 
 ## Project layout
@@ -463,14 +544,19 @@ jr_cache/
 │   ├── bucket_map.go          BucketMap (+ bucket pool)
 │   ├── cache_map.go           CacheMap (+ TTL)
 │   ├── cache_sharded_map.go   ShardedCacheMap
-│   └── sharded_map.go         ShardedMap
+│   ├── sharded_map.go         ShardedMap
+│   └── gc_comp.go             GCManager (background sweeper)
 ├── tests/
 │   ├── *_test.go              unit tests (package tests)
-│   └── bench/                 benchmark suite (package bench)
+│   ├── bench/                 benchmark suite (package bench)
+│   └── compare/               comparison against other libraries (own module)
 ├── docs/
 │   ├── benchmark.md           full benchmark report
-│   └── benchmark_raw.txt      raw `go test -bench` output for benchstat
+│   ├── benchmark_raw.txt      raw `go test -bench` output for benchstat
+│   ├── comparison.md          hit-ratio, throughput and feature comparison
+│   └── comparison_raw.txt     raw output of the comparison run
 ├── go.mod
+├── LICENSE
 └── README.MD
 ```
 
@@ -484,7 +570,8 @@ Ideas that fall naturally out of the current design, none started:
 - Generate `docs/benchmark.md` from a checked-in script.
 
 Done: allocation-free LFU `Get` (bucket pool + node reuse), `SetOnEvict`
-hook, `GlobalOrder` for the sharded cache.
+hook, `GlobalOrder` for the sharded cache, `GCManager` (background sweeper
+and runtime GC control).
 
 ## Contributing
 
@@ -498,6 +585,4 @@ hook, `GlobalOrder` for the sharded cache.
 
 ## License
 
-No license file has been added to this repository yet. Until one is, all
-rights are reserved by the author; add a `LICENSE` file (MIT and
-Apache-2.0 are the common choices for Go libraries) before publishing.
+[MIT](LICENSE) — use it, change it, ship it; keep the copyright notice.
