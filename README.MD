@@ -20,6 +20,7 @@ and sharded variants of both the map and the cache — all sharing one API.
   - [`OrderedMap`](#orderedmap)
   - [`BucketMap`](#bucketmap)
   - [`GCManager`](#gcmanager)
+- [Serialization](#serialization)
 - [Eviction policies](#eviction-policies)
 - [TTL semantics](#ttl-semantics)
 - [Concurrency](#concurrency)
@@ -68,6 +69,8 @@ Every structure exposes the same method names — `Get`, `Set`, `Has`,
 - **Global or per-shard eviction** on the sharded cache: exact LRU/LFU
   across every shard behind one shared order lock, or fully independent
   shards for maximum scaling.
+- **Serialization** of every structure to JSON or gob, optionally gzip or
+  zlib compressed, preserving order, frequencies and TTLs.
 - **Eviction hook** (`SetOnEvict`) called with the key and value of every
   entry the cache evicts or expires on its own.
 - **Background sweeper** (`GCManager`) that collects on an interval, a
@@ -357,6 +360,59 @@ The collect function runs **without** the manager's lock, so it may call
 back into the manager — but calling `Stop` from inside it is a caller
 error.
 
+## Serialization
+
+Every structure can be turned into a snapshot and back. A snapshot keeps
+what a plain `map` would lose — the order, the LFU bucket of each entry,
+each TTL, and the cache's own configuration:
+
+```go
+// To a file, in one call.
+err := cache.SaveToFile("cache.gob", jr_cache.GobFormat, jr_cache.GzipCompression, nil)
+
+// Back again, rebuilding the cache with the policy and capacity it had.
+restored, err := jr_cache.LoadCacheMapFromFile[string, int](
+	"cache.gob", jr_cache.GobFormat, jr_cache.GzipCompression)
+
+// Or keep the bytes yourself.
+data, err := jr_cache.Serialize(cache.Snapshot(), jr_cache.JSONFormat, jr_cache.NoCompression)
+snap, err := jr_cache.Deserialize[*jr_cache.CacheMapSnapshot[string, int]](
+	data, jr_cache.JSONFormat, jr_cache.NoCompression)
+err = cache.RestoreSnapshot(snap)
+```
+
+| | |
+|---|---|
+| Formats | `JSONFormat` (portable, readable), `GobFormat` (Go-native; keeps exact types) |
+| Compression | `NoCompression`, `GzipCompression`, `ZlibCompression` |
+| Per structure | `Snapshot()`, `RestoreSnapshot()`, `SaveToFile()`, `LoadFromFile()`, `ToMap()`, `FromMap()` |
+| Package level | `Serialize`, `Deserialize`, `SaveToFile`, `LoadFromFile`, `NewXFromSnapshot`, `LoadCacheMapFromFile`, `LoadShardedCacheMapFromFile` |
+
+The pipeline is **encode then compress**, and reading it back is
+**decompress then decode** — the format and algorithm you deserialize with
+must match the ones you serialized with, or you get an error rather than
+junk. `SaveToFile` writes to a temporary file and renames it over the
+target, so an interrupted save cannot leave a half-written file.
+
+Worth knowing:
+
+- `ToMap`/`FromMap` are the lossy shortcut: a plain `map[Key]Value`, no
+  order, no frequencies, no TTLs. Use snapshots to keep those.
+- Snapshots hold entries in a **slice**, not a map, so any comparable key
+  type survives — including structs, which a JSON object key cannot express.
+- Expired entries are left out of a snapshot, and an entry whose deadline
+  passed while the snapshot sat on disk is dropped on restore rather than
+  restored as already-expired.
+- Restoring a **sharded** structure re-hashes every key with the
+  destination's hash function. With the default hash, whose seed is random
+  per instance, keys land in different shards than before — the data and
+  TTLs come back, the shard layout is rebuilt.
+- An eviction hook is not part of a snapshot: a callback is program state,
+  not data. Re-install it with `SetOnEvict` after restoring.
+- `Snapshot` does not mutate the structure it reads, so it is safe to call
+  on a live cache; `ToMap` likewise leaves expired entries in place rather
+  than purging them.
+
 ## Eviction policies
 
 | Policy | Evicts | Access (`Get`, `Set` on existing key, `SetOrGet` hit) | Backed by |
@@ -522,7 +578,7 @@ cd tests/compare && go test -run HitRatio -v                        # eviction-p
 ## Testing
 
 ```
-go test ./...                 # 94 tests, ~2 s
+go test ./...                 # 111 tests, ~2 s
 go vet ./... && gofmt -l .    # both clean
 ```
 

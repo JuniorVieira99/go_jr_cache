@@ -1,6 +1,9 @@
 package jr_cache
 
-import "sync"
+import (
+	"os"
+	"sync"
+)
 
 // structs for the bucket map implementation
 
@@ -124,6 +127,15 @@ func (bm *BucketMap[Key, Value]) delete_bucket_if_empty(b *bucket[Key, Value]) {
 		bm.buckets.Delete(b.index)
 		bm.release_bucket(b)
 	}
+}
+
+// clear is Clear without the lock, for callers that already hold it.
+func (bm *BucketMap[Key, Value]) clear() {
+	for _, b, ok := bm.buckets.PopTop(); ok && len(bm.pool) < bm.poolSize; _, b, ok = bm.buckets.PopTop() {
+		bm.release_bucket(b)
+	}
+	bm.buckets.Clear()
+	bm.mapping = make(map[Key]uint64)
 }
 
 // insert_bucket creates a bucket for index and links it into the ordered map
@@ -503,11 +515,7 @@ func (bm *BucketMap[Key, Value]) Clear() {
 		defer bm.lock.Unlock()
 	}
 	// Keep as many of the buckets as the pool can hold; the rest go to the GC.
-	for _, b, ok := bm.buckets.PopTop(); ok && len(bm.pool) < bm.poolSize; _, b, ok = bm.buckets.PopTop() {
-		bm.release_bucket(b)
-	}
-	bm.buckets.Clear()
-	bm.mapping = make(map[Key]uint64)
+	bm.clear()
 }
 
 // WarmUp prepares count empty buckets ahead of time and lets the pool keep
@@ -546,4 +554,102 @@ func (b bucket[Key, Value]) Keys() []Key {
 		keys = append(keys, key)
 	}
 	return keys
+}
+
+// Serialization for the bucket map implementation
+
+// BucketMapSnapshot is a serializable picture of a bucket map. Entries are
+// listed bucket by bucket in ascending index order and, within a bucket, in
+// arrival order, so restoring one reproduces both orders exactly. Each
+// entry's Frequency is the index of the bucket it belongs to.
+type BucketMapSnapshot[Key comparable, Value any] struct {
+	Entries []CacheEntry[Key, Value] `json:"entries"`
+	Locked  bool                     `json:"locked"`
+}
+
+// ToMap returns every entry as a plain map. Bucket indices and order are
+// lost; use Snapshot to keep them.
+func (bm *BucketMap[Key, Value]) ToMap() map[Key]Value {
+	if bm.locked {
+		bm.lock.RLock()
+		defer bm.lock.RUnlock()
+	}
+	result := make(map[Key]Value, len(bm.mapping))
+	for index, ok := bm.buckets.TopKey(); ok; index, ok = bm.buckets.NextKey(index) {
+		b, _ := bm.buckets.Get(index)
+		for key, value := range b.data.ToMap() {
+			result[key] = value
+		}
+	}
+	return result
+}
+
+// FromMap adds every entry to the bottom bucket, in the arbitrary order Go
+// iterates the source map.
+func (bm *BucketMap[Key, Value]) FromMap(entries map[Key]Value) {
+	if bm.locked {
+		bm.lock.Lock()
+		defer bm.lock.Unlock()
+	}
+	for key, value := range entries {
+		bm.send_to_end(key, value, false)
+	}
+}
+
+// Snapshot captures the map, lowest bucket first.
+func (bm *BucketMap[Key, Value]) Snapshot() *BucketMapSnapshot[Key, Value] {
+	if bm.locked {
+		bm.lock.RLock()
+		defer bm.lock.RUnlock()
+	}
+	entries := make([]CacheEntry[Key, Value], 0, len(bm.mapping))
+	for index, ok := bm.buckets.TopKey(); ok; index, ok = bm.buckets.NextKey(index) {
+		b, _ := bm.buckets.Get(index)
+		for key, keyOK := b.data.TopKey(); keyOK; key, keyOK = b.data.NextKey(key) {
+			value, _ := b.data.Get(key)
+			entries = append(entries, CacheEntry[Key, Value]{Key: key, Value: value, Frequency: index})
+		}
+	}
+	return &BucketMapSnapshot[Key, Value]{Entries: entries, Locked: bm.locked}
+}
+
+// RestoreSnapshot replaces the contents of the map with the snapshot, putting
+// every entry back in the bucket it came from.
+func (bm *BucketMap[Key, Value]) RestoreSnapshot(snapshot *BucketMapSnapshot[Key, Value]) error {
+	if snapshot == nil {
+		return ErrNilSnapshot
+	}
+	if bm.locked {
+		bm.lock.Lock()
+		defer bm.lock.Unlock()
+	}
+	bm.clear()
+	for _, entry := range snapshot.Entries {
+		bm.send_to_bucket(entry.Frequency, entry.Key, entry.Value)
+	}
+	return nil
+}
+
+// NewBucketMapFromSnapshot builds a map from a snapshot.
+func NewBucketMapFromSnapshot[Key comparable, Value any](snapshot *BucketMapSnapshot[Key, Value], locked bool) (*BucketMap[Key, Value], error) {
+	bm := NewBucketMap[Key, Value](locked)
+	if err := bm.RestoreSnapshot(snapshot); err != nil {
+		return nil, err
+	}
+	return bm, nil
+}
+
+// SaveToFile writes a snapshot of the map to filename.
+func (bm *BucketMap[Key, Value]) SaveToFile(filename string, format SerializationFormat, algorithm CompressionAlgorithm, mode *os.FileMode) error {
+	return SaveToFile(bm.Snapshot(), filename, format, algorithm, mode)
+}
+
+// LoadFromFile replaces the contents of the map with a snapshot read from
+// filename.
+func (bm *BucketMap[Key, Value]) LoadFromFile(filename string, format SerializationFormat, algorithm CompressionAlgorithm) error {
+	snapshot, err := LoadFromFile[*BucketMapSnapshot[Key, Value]](filename, format, algorithm)
+	if err != nil {
+		return err
+	}
+	return bm.RestoreSnapshot(snapshot)
 }

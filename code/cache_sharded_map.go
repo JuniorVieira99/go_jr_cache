@@ -3,6 +3,7 @@ package jr_cache
 import (
 	"errors"
 	"hash/maphash"
+	"os"
 	"sync"
 	"time"
 )
@@ -65,6 +66,8 @@ type ShardedCacheMapConfig[Key comparable] struct {
 type ShardedCacheMapInterface[Key comparable, Value any] interface {
 	CacheMapInterface[Key, Value]
 	PopulateThreaded(entries map[Key]Value, threads int)
+	Snapshot() *ShardedCacheMapSnapshot[Key, Value]
+	RestoreSnapshot(snapshot *ShardedCacheMapSnapshot[Key, Value]) error
 	ShardCount() int
 	ShardIndex(key Key) int
 	GlobalOrder() bool
@@ -504,4 +507,159 @@ func (scm *ShardedCacheMap[Key, Value]) Clear() {
 	for _, shard := range scm.shards {
 		shard.Clear()
 	}
+}
+
+// Serialization for the sharded cache map implementation
+
+// ShardedCacheMapSnapshot is a serializable picture of a sharded cache: its
+// configuration and its live entries, shard by shard, each shard's entries in
+// eviction order.
+//
+// Restoring re-hashes every key with the destination cache's own hash
+// function, so a key only returns to the same shard if that cache uses the
+// same shard count and hash. With the default hash, whose seed is random per
+// cache, it will not — the entries and their TTLs come back, the shard layout
+// is rebuilt from scratch.
+type ShardedCacheMapSnapshot[Key comparable, Value any] struct {
+	Eviction    EvictionPolicy           `json:"eviction"`
+	MaxCapacity uint64                   `json:"max_capacity"`
+	ShardCount  int                      `json:"shard_count"`
+	GlobalOrder bool                     `json:"global_order"`
+	Locked      bool                     `json:"locked"`
+	Entries     []CacheEntry[Key, Value] `json:"entries"`
+}
+
+// Config returns the configuration a snapshot was taken with, minus the hash
+// function, which is not serializable.
+func (s *ShardedCacheMapSnapshot[Key, Value]) Config() ShardedCacheMapConfig[Key] {
+	return ShardedCacheMapConfig[Key]{
+		Eviction:    s.Eviction,
+		MaxCapacity: s.MaxCapacity,
+		ShardCount:  uint64(s.ShardCount),
+		Locked:      s.Locked,
+		GlobalOrder: s.GlobalOrder,
+	}
+}
+
+// ToMap returns every live entry as a plain map.
+func (scm *ShardedCacheMap[Key, Value]) ToMap() map[Key]Value {
+	if scm.global() {
+		result := make(map[Key]Value, scm.order.Len())
+		for key := range scm.order.ToMap() {
+			if value, ok := scm.values.Get(key); ok {
+				result[key] = value
+			}
+		}
+		return result
+	}
+	result := make(map[Key]Value, scm.Len())
+	for _, shard := range scm.shards {
+		for key, value := range shard.ToMap() {
+			result[key] = value
+		}
+	}
+	return result
+}
+
+// FromMap stores every entry, filling each shard under a single lock.
+func (scm *ShardedCacheMap[Key, Value]) FromMap(entries map[Key]Value) {
+	scm.PopulateThreaded(entries, 1)
+}
+
+// Snapshot captures the cache: its configuration and its live entries.
+func (scm *ShardedCacheMap[Key, Value]) Snapshot() *ShardedCacheMapSnapshot[Key, Value] {
+	snapshot := &ShardedCacheMapSnapshot[Key, Value]{
+		Eviction:    scm.eviction,
+		MaxCapacity: scm.MaxCapacity(),
+		ShardCount:  scm.ShardCount(),
+		GlobalOrder: scm.global(),
+		Locked:      scm.locked,
+	}
+	if scm.global() {
+		// The index holds the order and the TTLs; the shards hold the values.
+		for _, entry := range scm.order.Snapshot().Entries {
+			value, ok := scm.values.Get(entry.Key)
+			if !ok {
+				continue
+			}
+			snapshot.Entries = append(snapshot.Entries, CacheEntry[Key, Value]{
+				Key:       entry.Key,
+				Value:     value,
+				Frequency: entry.Frequency,
+				ExpiresAt: entry.ExpiresAt,
+			})
+		}
+		return snapshot
+	}
+	for _, shard := range scm.shards {
+		snapshot.Entries = append(snapshot.Entries, shard.Snapshot().Entries...)
+	}
+	return snapshot
+}
+
+// RestoreSnapshot replaces the contents of the cache with the snapshot,
+// keeping values, frequencies and TTLs. Shard placement is rebuilt by
+// re-hashing; see ShardedCacheMapSnapshot.
+func (scm *ShardedCacheMap[Key, Value]) RestoreSnapshot(snapshot *ShardedCacheMapSnapshot[Key, Value]) error {
+	if snapshot == nil {
+		return ErrNilSnapshot
+	}
+	scm.Clear()
+	now := time.Now()
+	for _, entry := range snapshot.Entries {
+		if entry.ExpiresAt.IsZero() {
+			scm.Set(entry.Key, entry.Value)
+			continue
+		}
+		if !now.Before(entry.ExpiresAt) {
+			continue
+		}
+		scm.SetWithTTL(entry.Key, entry.Value, entry.ExpiresAt.Sub(now))
+	}
+	return nil
+}
+
+// NewShardedCacheMapFromSnapshot builds a cache from a snapshot, using the
+// configuration the snapshot was taken with. Pass a hash function in config
+// to override the default.
+func NewShardedCacheMapFromSnapshot[Key comparable, Value any](snapshot *ShardedCacheMapSnapshot[Key, Value], hash func(Key) uint64) (*ShardedCacheMap[Key, Value], error) {
+	if snapshot == nil {
+		return nil, ErrNilSnapshot
+	}
+	config := snapshot.Config()
+	config.Hash = hash
+	scm, err := NewShardedCacheMap[Key, Value](config)
+	if err != nil {
+		return nil, err
+	}
+	if err := scm.RestoreSnapshot(snapshot); err != nil {
+		return nil, err
+	}
+	return scm, nil
+}
+
+// SaveToFile writes a snapshot of the cache to filename.
+func (scm *ShardedCacheMap[Key, Value]) SaveToFile(filename string, format SerializationFormat, algorithm CompressionAlgorithm, mode *os.FileMode) error {
+	return SaveToFile(scm.Snapshot(), filename, format, algorithm, mode)
+}
+
+// LoadFromFile replaces the contents of the cache with a snapshot read from
+// filename. The cache keeps its own configuration; use
+// LoadShardedCacheMapFromFile to rebuild one from the snapshot's.
+func (scm *ShardedCacheMap[Key, Value]) LoadFromFile(filename string, format SerializationFormat, algorithm CompressionAlgorithm) error {
+	snapshot, err := LoadFromFile[*ShardedCacheMapSnapshot[Key, Value]](filename, format, algorithm)
+	if err != nil {
+		return err
+	}
+	return scm.RestoreSnapshot(snapshot)
+}
+
+// LoadShardedCacheMapFromFile reads a snapshot and builds the cache it
+// describes, configuration included.
+func LoadShardedCacheMapFromFile[Key comparable, Value any](filename string, format SerializationFormat, algorithm CompressionAlgorithm, hash func(Key) uint64) (*ShardedCacheMap[Key, Value], error) {
+	snapshot, err := LoadFromFile[*ShardedCacheMapSnapshot[Key, Value]](filename, format, algorithm)
+	if err != nil {
+		return nil, err
+	}
+	return NewShardedCacheMapFromSnapshot(snapshot, hash)
 }

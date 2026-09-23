@@ -346,6 +346,7 @@ Taken from each library's documentation and API at the versions above.
 | Bulk load | `Populate` (per-shard, threaded) | no | no | no (`BulkGet` only) | no | no | no | no | `Load` (gob) | `MSet` |
 | Iteration | `Range` (sharded map), `NextKey` walk (ordered map) | `Keys`, `Values` | no | `All`, `Keys` (iterators) | `Range` | `GetALL`, `Keys` | `Iterator` | `NewIterator` | `Items` | `IterBuffered`, `Keys` |
 | Stats / metrics | no | no | `Metrics` | `StatsRecorder` | `Stats` | `HitRate` etc. | `Stats` | `HitRate` etc. | `ItemCount` | `Count` |
+| Serialization / persistence | snapshots to JSON or gob, gzip/zlib, order + TTLs preserved | no | no | no | `HybridCache` (disk tier) | `SerializeFunc`/`DeserializeFunc` hooks | no | no | `Save`/`SaveFile`/`LoadFile` (gob) | no |
 | Runtime GC control | `DisableGCCompletely` / `RestoreGC` (process-global; see the caveats) | no | no | no | no | no | no | no | no | no |
 | Building blocks exposed | ordered map, bucket map, sharded map | `simplelru` | no | no | no | no | no | no | no | it is the block |
 | Background goroutines | none unless a `GCManager` is started | `expirable` starts one | yes (policy workers) | none by default | yes | none | yes (clean window) | none | yes (janitor) | none |

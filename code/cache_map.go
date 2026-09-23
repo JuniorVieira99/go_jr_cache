@@ -2,6 +2,7 @@ package jr_cache
 
 import (
 	"errors"
+	"os"
 	"sync"
 	"time"
 )
@@ -554,4 +555,187 @@ func (cm *CacheMap[Key, Value]) Clear() {
 	}
 	cm.entries.Clear()
 	cm.expiry = make(map[Key]time.Time)
+}
+
+// Serialization for the cache map implementation
+
+// CacheMapSnapshot is a serializable picture of a cache: its configuration
+// and every live entry, listed from the top (the end the policy evicts from
+// first, for LRU/FIFO/LFU) to the bottom. Each entry carries its bucket index
+// under the frequency policies and its expiry deadline if it has one, so a
+// restored cache evicts in the same order the original would have.
+//
+// Expired entries are left out, and the eviction hook is not part of a
+// snapshot: a hook is program state, not data.
+type CacheMapSnapshot[Key comparable, Value any] struct {
+	Eviction    EvictionPolicy           `json:"eviction"`
+	MaxCapacity uint64                   `json:"max_capacity"`
+	Locked      bool                     `json:"locked"`
+	Entries     []CacheEntry[Key, Value] `json:"entries"`
+}
+
+// Config returns the configuration a snapshot was taken with, so a cache can
+// be rebuilt with NewCacheMap before restoring into it.
+func (s *CacheMapSnapshot[Key, Value]) Config() CacheMapConfig {
+	return CacheMapConfig{
+		Eviction:    s.Eviction,
+		MaxCapacity: s.MaxCapacity,
+		Locked:      s.Locked,
+	}
+}
+
+// ToMap returns every live entry as a plain map. Expired entries are skipped
+// but, unlike Get, not removed: reading a cache should not mutate it. Order,
+// frequency and TTLs are lost; use Snapshot to keep them.
+func (cm *CacheMap[Key, Value]) ToMap() map[Key]Value {
+	if cm.locked {
+		cm.lock.RLock()
+		defer cm.lock.RUnlock()
+	}
+	result := make(map[Key]Value, cm.entries.Len())
+	for key, value := range cm.entries.ToMap() {
+		if !cm.expired(key) {
+			result[key] = value
+		}
+	}
+	return result
+}
+
+// FromMap stores every entry, in the arbitrary order Go iterates the source
+// map, evicting as needed if the cache is full. Entries get no TTL.
+func (cm *CacheMap[Key, Value]) FromMap(entries map[Key]Value) {
+	if cm.locked {
+		cm.lock.Lock()
+		defer cm.lock.Unlock()
+	}
+	for key, value := range entries {
+		cm.set(key, value)
+		delete(cm.expiry, key)
+	}
+}
+
+// Snapshot captures the cache: its configuration and its live entries in
+// eviction order, top first.
+func (cm *CacheMap[Key, Value]) Snapshot() *CacheMapSnapshot[Key, Value] {
+	if cm.locked {
+		cm.lock.RLock()
+		defer cm.lock.RUnlock()
+	}
+	snapshot := &CacheMapSnapshot[Key, Value]{
+		Eviction:    cm.eviction,
+		MaxCapacity: cm.maxCapacity,
+		Locked:      cm.locked,
+		Entries:     make([]CacheEntry[Key, Value], 0, cm.entries.Len()),
+	}
+	for _, entry := range cm.ordered_entries() {
+		if cm.expired(entry.Key) {
+			continue
+		}
+		snapshot.Entries = append(snapshot.Entries, entry)
+	}
+	return snapshot
+}
+
+// ordered_entries walks the backing structure from top to bottom, filling in
+// the bucket index and expiry of every entry. Callers hold the lock.
+func (cm *CacheMap[Key, Value]) ordered_entries() []CacheEntry[Key, Value] {
+	entries := make([]CacheEntry[Key, Value], 0, cm.entries.Len())
+	if cm.uses_buckets() {
+		for _, entry := range cm.bucketMap.Snapshot().Entries {
+			entry.ExpiresAt = cm.expiry[entry.Key]
+			entries = append(entries, entry)
+		}
+		return entries
+	}
+	for key, ok := cm.orderedMap.TopKey(); ok; key, ok = cm.orderedMap.NextKey(key) {
+		value, _ := cm.orderedMap.Get(key)
+		entries = append(entries, CacheEntry[Key, Value]{
+			Key:       key,
+			Value:     value,
+			ExpiresAt: cm.expiry[key],
+		})
+	}
+	return entries
+}
+
+// RestoreSnapshot replaces the contents of the cache with the snapshot,
+// keeping eviction order, frequencies and TTLs. The cache's own eviction
+// policy and capacity are left alone — restore into a cache built with
+// snapshot.Config() to get those back too. Entries whose deadline has already
+// passed are dropped rather than restored as expired.
+func (cm *CacheMap[Key, Value]) RestoreSnapshot(snapshot *CacheMapSnapshot[Key, Value]) error {
+	if snapshot == nil {
+		return ErrNilSnapshot
+	}
+	if cm.locked {
+		cm.lock.Lock()
+		defer cm.lock.Unlock()
+	}
+	cm.entries.Clear()
+	cm.expiry = make(map[Key]time.Time)
+
+	now := time.Now()
+	for _, entry := range snapshot.Entries {
+		if !entry.ExpiresAt.IsZero() && !now.Before(entry.ExpiresAt) {
+			continue
+		}
+		// Replaying top first means the last entry inserted ends up at the
+		// bottom, which is where the original had it.
+		if cm.uses_buckets() {
+			index := entry.Frequency
+			if index == 0 {
+				index = 1
+			}
+			cm.make_room()
+			cm.bucketMap.Set(index, entry.Key, entry.Value)
+		} else {
+			cm.insert(entry.Key, entry.Value)
+		}
+		if !entry.ExpiresAt.IsZero() {
+			cm.expiry[entry.Key] = entry.ExpiresAt
+		}
+	}
+	return nil
+}
+
+// NewCacheMapFromSnapshot builds a cache from a snapshot, using the
+// configuration the snapshot was taken with.
+func NewCacheMapFromSnapshot[Key comparable, Value any](snapshot *CacheMapSnapshot[Key, Value]) (*CacheMap[Key, Value], error) {
+	if snapshot == nil {
+		return nil, ErrNilSnapshot
+	}
+	cm, err := NewCacheMap[Key, Value](snapshot.Config())
+	if err != nil {
+		return nil, err
+	}
+	if err := cm.RestoreSnapshot(snapshot); err != nil {
+		return nil, err
+	}
+	return cm, nil
+}
+
+// SaveToFile writes a snapshot of the cache to filename.
+func (cm *CacheMap[Key, Value]) SaveToFile(filename string, format SerializationFormat, algorithm CompressionAlgorithm, mode *os.FileMode) error {
+	return SaveToFile(cm.Snapshot(), filename, format, algorithm, mode)
+}
+
+// LoadFromFile replaces the contents of the cache with a snapshot read from
+// filename. The cache keeps its own policy and capacity; use
+// LoadCacheMapFromFile to rebuild one with the snapshot's configuration.
+func (cm *CacheMap[Key, Value]) LoadFromFile(filename string, format SerializationFormat, algorithm CompressionAlgorithm) error {
+	snapshot, err := LoadFromFile[*CacheMapSnapshot[Key, Value]](filename, format, algorithm)
+	if err != nil {
+		return err
+	}
+	return cm.RestoreSnapshot(snapshot)
+}
+
+// LoadCacheMapFromFile reads a snapshot and builds the cache it describes,
+// configuration included.
+func LoadCacheMapFromFile[Key comparable, Value any](filename string, format SerializationFormat, algorithm CompressionAlgorithm) (*CacheMap[Key, Value], error) {
+	snapshot, err := LoadFromFile[*CacheMapSnapshot[Key, Value]](filename, format, algorithm)
+	if err != nil {
+		return nil, err
+	}
+	return NewCacheMapFromSnapshot(snapshot)
 }

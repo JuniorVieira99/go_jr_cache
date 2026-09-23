@@ -1,6 +1,9 @@
 package jr_cache
 
-import "sync"
+import (
+	"os"
+	"sync"
+)
 
 // Structs for the sharded map implementation
 
@@ -30,6 +33,10 @@ type ShardedMapConfig[Key comparable] struct {
 // ShardedMapInterface is the unordered subset of CommonMapInterface: the
 // same names and signatures, minus the methods that need a top and a bottom.
 type ShardedMapInterface[Key comparable, Value any] interface {
+	ToMap() map[Key]Value
+	FromMap(entries map[Key]Value)
+	Snapshot() *ShardedMapSnapshot[Key, Value]
+	RestoreSnapshot(snapshot *ShardedMapSnapshot[Key, Value]) error
 	Get(key Key) (Value, bool)
 	Set(key Key, value Value)
 	SetOrGet(key Key, value Value) (Value, bool)
@@ -293,4 +300,94 @@ func (sm *ShardedMap[Key, Value]) Populate(entries map[Key]Value, threads int) {
 	run_per_shard(parts, threads, func(index int, part map[Key]Value) {
 		sm.shards[index].set_all(part)
 	})
+}
+
+// Serialization for the sharded map implementation
+
+// ShardedMapSnapshot is a serializable picture of a sharded map. A sharded
+// map keeps no order, so the entries are simply listed shard by shard.
+//
+// ShardCount is recorded for information: restoring re-hashes every key with
+// the destination map's own hash function, so a key only lands in the same
+// shard again if that map uses the same shard count and hash. With the
+// default hash, whose seed is random per map, it will not.
+type ShardedMapSnapshot[Key comparable, Value any] struct {
+	ShardCount int                 `json:"shard_count"`
+	Entries    []Entry[Key, Value] `json:"entries"`
+}
+
+// ToMap returns every entry as a plain map.
+func (sm *ShardedMap[Key, Value]) ToMap() map[Key]Value {
+	result := make(map[Key]Value, sm.Len())
+	for _, s := range sm.shards {
+		for key, value := range s.snapshot() {
+			result[key] = value
+		}
+	}
+	return result
+}
+
+// FromMap stores every entry, filling each shard under a single lock.
+func (sm *ShardedMap[Key, Value]) FromMap(entries map[Key]Value) {
+	sm.Populate(entries, 1)
+}
+
+// Snapshot captures every entry, shard by shard.
+func (sm *ShardedMap[Key, Value]) Snapshot() *ShardedMapSnapshot[Key, Value] {
+	snapshot := &ShardedMapSnapshot[Key, Value]{
+		ShardCount: len(sm.shards),
+		Entries:    make([]Entry[Key, Value], 0, sm.Len()),
+	}
+	for _, s := range sm.shards {
+		for key, value := range s.snapshot() {
+			snapshot.Entries = append(snapshot.Entries, Entry[Key, Value]{Key: key, Value: value})
+		}
+	}
+	return snapshot
+}
+
+// RestoreSnapshot replaces the contents of the map with the snapshot.
+func (sm *ShardedMap[Key, Value]) RestoreSnapshot(snapshot *ShardedMapSnapshot[Key, Value]) error {
+	if snapshot == nil {
+		return ErrNilSnapshot
+	}
+	sm.Clear()
+	for _, entry := range snapshot.Entries {
+		sm.Set(entry.Key, entry.Value)
+	}
+	return nil
+}
+
+// NewShardedMapFromSnapshot builds a map from a snapshot, using the shard
+// count the snapshot records unless config overrides it.
+func NewShardedMapFromSnapshot[Key comparable, Value any](snapshot *ShardedMapSnapshot[Key, Value], config ShardedMapConfig[Key]) (*ShardedMap[Key, Value], error) {
+	if snapshot == nil {
+		return nil, ErrNilSnapshot
+	}
+	if config.ShardCount == 0 {
+		config.ShardCount = uint64(snapshot.ShardCount)
+	}
+	sm, err := NewShardedMap[Key, Value](config)
+	if err != nil {
+		return nil, err
+	}
+	if err := sm.RestoreSnapshot(snapshot); err != nil {
+		return nil, err
+	}
+	return sm, nil
+}
+
+// SaveToFile writes a snapshot of the map to filename.
+func (sm *ShardedMap[Key, Value]) SaveToFile(filename string, format SerializationFormat, algorithm CompressionAlgorithm, mode *os.FileMode) error {
+	return SaveToFile(sm.Snapshot(), filename, format, algorithm, mode)
+}
+
+// LoadFromFile replaces the contents of the map with a snapshot read from
+// filename.
+func (sm *ShardedMap[Key, Value]) LoadFromFile(filename string, format SerializationFormat, algorithm CompressionAlgorithm) error {
+	snapshot, err := LoadFromFile[*ShardedMapSnapshot[Key, Value]](filename, format, algorithm)
+	if err != nil {
+		return err
+	}
+	return sm.RestoreSnapshot(snapshot)
 }

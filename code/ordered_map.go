@@ -1,9 +1,13 @@
 package jr_cache
 
-import "sync"
+import (
+	"os"
+	"sync"
+)
 
 // Structs for the ordered map implementation
 
+// node represents an element in the doubly linked list used by OrderedMap.
 type node[Key comparable, Value any] struct {
 	Key   Key
 	Value Value
@@ -138,6 +142,27 @@ func (om *OrderedMap[Key, Value]) move_node_to_top(node *node[Key, Value]) {
 func (om *OrderedMap[Key, Value]) move_node_to_bottom(node *node[Key, Value]) {
 	om.unlink_node(node)
 	om.link_node_at_bottom(node)
+}
+
+// set_bottom is SetBottom without the lock, for callers that already hold it.
+func (om *OrderedMap[Key, Value]) set_bottom(key Key, value Value) {
+	node, exists := om.nodes[key]
+	if exists {
+		node.Value = value
+		om.move_node_to_bottom(node)
+		return
+	}
+	node = newNode(key, value, nil, nil)
+	om.nodes[key] = node
+	om.link_node_at_bottom(node)
+}
+
+// clear is Clear without the lock, for callers that already hold it.
+func (om *OrderedMap[Key, Value]) clear() {
+	om.head = nil
+	om.tail = nil
+	om.size = 0
+	clear(om.nodes)
 }
 
 // pop removes key from both the list and the index and returns its value.
@@ -398,15 +423,7 @@ func (om *OrderedMap[Key, Value]) SetBottom(key Key, value Value) {
 		om.lock.Lock()
 		defer om.lock.Unlock()
 	}
-	node, exists := om.nodes[key]
-	if exists {
-		node.Value = value
-		om.move_node_to_bottom(node)
-	} else {
-		node = newNode(key, value, nil, nil)
-		om.nodes[key] = node
-		om.link_node_at_bottom(node)
-	}
+	om.set_bottom(key, value)
 }
 
 // SetAfter inserts key directly below anchor, moving it if it already exists.
@@ -450,10 +467,98 @@ func (om *OrderedMap[Key, Value]) Clear() {
 		om.lock.Lock()
 		defer om.lock.Unlock()
 	}
-	om.head = nil
-	om.tail = nil
-	om.size = 0
 	// clear keeps the map's storage, so a map that is emptied and refilled
 	// (a pooled bucket, for instance) does not allocate again.
-	clear(om.nodes)
+	om.clear()
+}
+
+// Serialization for the ordered map implementation
+
+// OrderedMapSnapshot is a serializable picture of an ordered map. Entries are
+// listed from the top to the bottom, so restoring one reproduces the order
+// exactly.
+type OrderedMapSnapshot[Key comparable, Value any] struct {
+	Entries []Entry[Key, Value] `json:"entries"`
+	Locked  bool                `json:"locked"`
+}
+
+// ToMap returns every entry as a plain map. The order is lost; use Snapshot
+// to keep it.
+func (om *OrderedMap[Key, Value]) ToMap() map[Key]Value {
+	if om.locked {
+		om.lock.RLock()
+		defer om.lock.RUnlock()
+	}
+	result := make(map[Key]Value, om.size)
+	for node := om.head; node != nil; node = node.Next {
+		result[node.Key] = node.Value
+	}
+	return result
+}
+
+// FromMap adds every entry to the bottom of the map, in the arbitrary order
+// Go iterates the source map. Existing keys are moved to the bottom.
+func (om *OrderedMap[Key, Value]) FromMap(entries map[Key]Value) {
+	if om.locked {
+		om.lock.Lock()
+		defer om.lock.Unlock()
+	}
+	for key, value := range entries {
+		om.set_bottom(key, value)
+	}
+}
+
+// Snapshot captures the map, top entry first.
+func (om *OrderedMap[Key, Value]) Snapshot() *OrderedMapSnapshot[Key, Value] {
+	if om.locked {
+		om.lock.RLock()
+		defer om.lock.RUnlock()
+	}
+	entries := make([]Entry[Key, Value], 0, om.size)
+	for node := om.head; node != nil; node = node.Next {
+		entries = append(entries, Entry[Key, Value]{Key: node.Key, Value: node.Value})
+	}
+	return &OrderedMapSnapshot[Key, Value]{Entries: entries, Locked: om.locked}
+}
+
+// RestoreSnapshot replaces the contents of the map with the snapshot, keeping
+// its order. The map's own locked setting is left alone: whether a structure
+// synchronises itself is a property of how it is being used, not of the data.
+func (om *OrderedMap[Key, Value]) RestoreSnapshot(snapshot *OrderedMapSnapshot[Key, Value]) error {
+	if snapshot == nil {
+		return ErrNilSnapshot
+	}
+	if om.locked {
+		om.lock.Lock()
+		defer om.lock.Unlock()
+	}
+	om.clear()
+	for _, entry := range snapshot.Entries {
+		om.set_bottom(entry.Key, entry.Value)
+	}
+	return nil
+}
+
+// NewOrderedMapFromSnapshot builds a map from a snapshot.
+func NewOrderedMapFromSnapshot[Key comparable, Value any](snapshot *OrderedMapSnapshot[Key, Value], locked bool) (*OrderedMap[Key, Value], error) {
+	om := NewOrderedMap[Key, Value](locked)
+	if err := om.RestoreSnapshot(snapshot); err != nil {
+		return nil, err
+	}
+	return om, nil
+}
+
+// SaveToFile writes a snapshot of the map to filename.
+func (om *OrderedMap[Key, Value]) SaveToFile(filename string, format SerializationFormat, algorithm CompressionAlgorithm, mode *os.FileMode) error {
+	return SaveToFile(om.Snapshot(), filename, format, algorithm, mode)
+}
+
+// LoadFromFile replaces the contents of the map with a snapshot read from
+// filename.
+func (om *OrderedMap[Key, Value]) LoadFromFile(filename string, format SerializationFormat, algorithm CompressionAlgorithm) error {
+	snapshot, err := LoadFromFile[*OrderedMapSnapshot[Key, Value]](filename, format, algorithm)
+	if err != nil {
+		return err
+	}
+	return om.RestoreSnapshot(snapshot)
 }
