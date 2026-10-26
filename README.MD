@@ -292,9 +292,11 @@ k, v, ok := bm.Top()               // "b" — lowest bucket, oldest there
 bm.WarmUp(64)                      // pre-allocate buckets for bursty workloads
 ```
 
-Buckets are pooled: emptied buckets are kept for reuse (`DefaultWarmBuckets`
-= 16, grow it with `WarmUp`), so moving a key between buckets does not
-allocate a bucket.
+Every key maps straight to its list node, and every node knows its bucket,
+so a read is one hash lookup and moving a key to a neighbouring bucket
+(what an LFU hit does) needs no further lookup at all. Buckets are pooled:
+emptied buckets are kept for reuse (`DefaultWarmBuckets` = 16, grow it with
+`WarmUp`), so moving a key between buckets does not allocate a bucket.
 
 ### `GCManager`
 
@@ -483,7 +485,7 @@ contention its sharded LRU beats every mutex-based cache, but the
 lock-free readers (otter, theine, ristretto) serve parallel hits 10–30×
 faster because a `jr_cache` `Get` takes a write lock to record the
 access. Its exact LFU matches W-TinyLFU hit ratios within a point at
-3–5× the cost. Choose it for a **choice of policy** in one API, **ordered
+about the cost of its LRU. Choose it for a **choice of policy** in one API, **ordered
 access** to the least/most end, or the **underlying structures** as
 first-class types; choose otter/theine when many goroutines hammer one
 hot cache; bigcache/freecache to keep hundreds of millions of entries out
@@ -498,43 +500,45 @@ Windows, `-benchtime=500ms`), at **10,000 entries**; `Parallel` rows are a
 
 | Structure | Operation | ns/op | allocs/op |
 |---|---|---:|---:|
-| `OrderedMap` | Get | 10.7 | 0 |
-| `OrderedMap` | Set (move existing) | 14.3 | 0 |
-| `BucketMap` | Get | 41.5 | 0 |
-| `BucketMap` | Bump (move to next bucket) | 97.7 | 0 |
-| `CacheMap` LRU | Get | 18.1 | 0 |
-| `CacheMap` LRU | Set (evicting) | 91.7 | 1 |
-| `CacheMap` LRU | Get on a key with a TTL | 27.3 | 0 |
-| `CacheMap` LFU | Get | 77.6 | 0 |
-| `CacheMap` LFU | Set (evicting) | 171 | 1 |
-| `CacheMap` LRU, locked | Get | 29.8 | 0 |
-| `CacheMap` LRU, locked | **Parallel** | 67.6 | 0 |
-| `CacheMap` LFU, locked | **Parallel** | 202 | 0 |
-| `ShardedCacheMap` LRU, 16 shards | Get (single thread) | 43.2 | 0 |
-| `ShardedCacheMap` LRU, 16 shards | **Parallel** | 46.1 | 0 |
-| `ShardedCacheMap` LFU, 16 shards | **Parallel** | 80.4 | 0 |
-| `ShardedCacheMap` LRU, global order | Get (single thread) | 66.9 | 0 |
-| `ShardedCacheMap` LRU, global order | **Parallel** | 161 | 0 |
-| `ShardedCacheMap` LRU, global order | Top / Len | 46.4 / 11.2 | 0 |
-| `ShardedMap` 16 shards | Get | 23.1 | 0 |
-| `ShardedMap` 16 shards | Set | 29.3 | 0 |
-| `ShardedMap` 16 shards | Modify | 33.1 | 0 |
-| `ShardedMap` 16 shards | **Parallel** | 49.9 | 0 |
+| `OrderedMap` | Get | 7.31 | 0 |
+| `OrderedMap` | Set (move existing) | 11.2 | 0 |
+| `BucketMap` | Get | 7.14 | 0 |
+| `BucketMap` | Bump (move to next bucket) | 16.7 | 0 |
+| `CacheMap` LRU | Get | 14.2 | 0 |
+| `CacheMap` LRU | Set (evicting) | 60.1 | 0 |
+| `CacheMap` LRU | Get on a key with a TTL | 22.2 | 0 |
+| `CacheMap` LFU | Get | 16.6 | 0 |
+| `CacheMap` LFU | Set (evicting) | 69.5 | 0 |
+| `CacheMap` LRU, locked | Get | 29.6 | 0 |
+| `CacheMap` LRU, locked | **Parallel** | 87.0 | 0 |
+| `CacheMap` LFU, locked | **Parallel** | 82.0 | 0 |
+| `ShardedCacheMap` LRU, 16 shards | Get (single thread) | 29.6 | 0 |
+| `ShardedCacheMap` LRU, 16 shards | **Parallel** | 39.1 | 0 |
+| `ShardedCacheMap` LFU, 16 shards | **Parallel** | 33.7 | 0 |
+| `ShardedCacheMap` LRU, global order | Get (single thread) | 41.9 | 0 |
+| `ShardedCacheMap` LRU, global order | **Parallel** | 227 | 0 |
+| `ShardedCacheMap` LRU, global order | Top / Len | 36.7 / 11.4 | 0 |
+| `ShardedMap` 16 shards | Get | 16.8 | 0 |
+| `ShardedMap` 16 shards | Set | 24.7 | 0 |
+| `ShardedMap` 16 shards | Modify | 28.0 | 0 |
+| `ShardedMap` 16 shards | **Parallel** | 49.3 | 0 |
 
 Takeaways:
 
-- LRU reads and writes are in the tens of nanoseconds with no allocation.
-- LFU costs about 2.5× LRU per `Get` and allocates nothing: every read
-  moves the key to the next frequency bucket, but buckets are pooled and
-  the key's list node moves with it.
+- LRU reads and writes are in the tens of nanoseconds with no allocation,
+  and so is a `Set` that evicts: the evicted entry's node is reused.
+- LFU costs about what LRU costs per `Get` and allocates nothing: every
+  read moves the key to the next frequency bucket, and since every node
+  points at its bucket and the buckets are a sorted list, that move needs
+  no hash lookup beyond finding the key.
 - A global order on the sharded cache makes eviction exact and `Top`/`Len`
-  O(1), but every operation takes the shared index lock: ~3.5× slower than
-  per-shard order under contention (161 vs 46 ns for LRU), and slower than
+  O(1), but every operation takes the shared index lock: ~5× slower than
+  per-shard order under contention (227 vs 39 ns for LRU), and slower than
   a single locked `CacheMap` too, since each call takes two locks.
-- Sharding is slower single-threaded (hashing + indirection) and 1.5× (LRU)
-  to 2.4× (LFU) faster under contention. For cheap keys, supply an
-  identity-style `Hash` to remove most of the single-threaded penalty.
-- A TTL adds ~10 ns to a `Get` and ~20–35 ns to a `Set`.
+- Sharding costs a little single-threaded (hashing + indirection) and is
+  2.2× (LRU) to 2.4× (LFU) faster under contention. For cheap keys, supply
+  an identity-style `Hash` to remove most of the single-threaded penalty.
+- A TTL adds ~6–12 ns to a `Get` and ~15–25 ns to a `Set`.
 
 Run them yourself:
 
@@ -554,7 +558,7 @@ cd tests/compare && go test -run HitRatio -v                        # eviction-p
   at the cost of one shared lock.
 - **`Top`/`Bottom` on a per-shard cache** use the fullest shard (lowest
   index on ties) — an approximation, since there is no global order. They
-  and `Len` visit every shard (~170–200 ns for 16 shards). With a global
+  and `Len` visit every shard (~170–210 ns for 16 shards). With a global
   order they are exact and O(1).
 - **Global order and races.** In global-order mode a `Set` writes the value
   to its shard and then the key to the shared index; a concurrent eviction
@@ -564,27 +568,34 @@ cd tests/compare && go test -run HitRatio -v                        # eviction-p
 - **Capacity is by entry count**, not bytes. Size your `Value` type
   accordingly or wrap the cache if you need a byte budget.
 - **LFU is one bucket per distinct frequency.** With adversarial access
-  patterns (every key at a different count) that is one bucket per key;
-  the bucket pool and node reuse keep this allocation-free but not free.
+  patterns (every key at a different count) that is one bucket per key; a
+  key alone in its bucket takes the bucket along on a hit (it is
+  renumbered in place), so this stays allocation-free, but each such hit
+  updates the bucket index.
 - **`Populate` vs `PopulateThreaded`.** Partitioning by shard costs an
   allocation per entry, so the threaded form only wins when per-entry work
-  is heavier than a map insert — the LFU cache, yes; a bare `ShardedMap`,
-  no. Numbers are in the benchmark report.
-- **`GetAllBuckets`** returns shallow copies that share their entry maps
-  with the live buckets: treat them as read-only snapshots.
+  is heavier than a map insert. Since LFU inserts became cheap that is
+  rarely the case: it roughly breaks even on an LFU cache and loses on an
+  LRU cache and a bare `ShardedMap`. Numbers are in the benchmark report.
+- **`GetAllBuckets`** returns shallow copies that share their entry lists
+  with the live buckets: treat them as read-only snapshots, and do not
+  modify the map while walking one.
 - **No background goroutines.** Nothing runs unless you call it; expired
   entries are reclaimed lazily or by `DeleteExpired`.
 
 ## Testing
 
 ```
-go test ./...                 # 111 tests, ~2 s
+go test ./...                 # 114 tests, ~3 s
 go vet ./... && gofmt -l .    # both clean
 ```
 
 Tests live in `tests/` as an external package and cover every public
 method, the eviction order of each policy, TTL edge cases, bucket pooling,
-5,000-operation randomised invariant checks on the bucket map, goroutine
+5,000-operation randomised invariant checks on the bucket map, 20,000-step
+model tests that replay random operations against a naive reference
+implementation of the bucket map and of every cache policy and compare the
+full contents, order and evictions after each step, goroutine
 hammering of every locked structure, and the `GCManager` — its triggers,
 start/stop lifecycle, goroutine-leak freedom, and the disable/restore round
 trip (which puts the process GC settings back even when a test fails). The race detector is worth
@@ -625,7 +636,9 @@ Ideas that fall naturally out of the current design, none started:
   `GetOrCompute` on the index).
 - Generate `docs/benchmark.md` from a checked-in script.
 
-Done: allocation-free LFU `Get` (bucket pool + node reuse), `SetOnEvict`
+Done: O(1) LFU (one hash lookup per hit; buckets linked as a list),
+single-lookup `CacheMap` hot paths, allocation-free evicting `Set` (the
+evicted node is reused), allocation-free LFU `Get` (bucket pool), `SetOnEvict`
 hook, `GlobalOrder` for the sharded cache, `GCManager` (background sweeper
 and runtime GC control).
 

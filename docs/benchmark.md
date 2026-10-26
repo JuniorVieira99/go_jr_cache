@@ -6,86 +6,112 @@ operations, at 500 / 1,000 / 5,000 / 10,000 / 50,000 entries. The
 `GCManager` benchmarks run a different workload at different sizes, so they
 have their own section ([Turning the collector off](#turning-the-collector-off))
 and are not in the per-module tables below. All rows come
-from one session on an idle machine; a previous session on the same
-machine measured ~30–40 % slower across unchanged code, so compare rows
-within this report rather than against older copies of it.
+from one session on an idle machine; sessions on the same machine have
+differed by 30–40 % across unchanged code, so compare rows within this
+report rather than against older copies of it. Where this report quotes a
+before/after for a code change, the two sides were measured in the same
+session, alternating the old and new builds.
 
 ## Highlights
 
 **Baseline costs.** `OrderedMap` is the floor everything else builds on:
-8–13 ns per `Get`, 11–14 ns per `Set` on small maps, zero allocations in
-steady state, and one 32-byte node per inserted entry. `BucketMap.Has` and
-`GetBucketIndex` (5–12 ns) cost the same because both are a single map
-lookup; `BucketMap.Get` (37–51 ns) pays for three lookups — key → bucket
-index → bucket → entry.
+6–9 ns per `Get`, 9–14 ns per `Set`, zero allocations in steady state, and
+one 32-byte node per inserted entry. `BucketMap.Get` (6–9 ns) now costs the
+same as `OrderedMap.Get`: every key maps straight to its list node, so a
+read is one hash lookup. `GetBucketIndex` (5–8 ns) reads the index through
+the node's bucket pointer.
 
-**Scaling with size is flat until the working set leaves cache.** Most
-per-op rows grow only 30–50 % from 500 to 50,000 entries. Anything that
-touches list pointers on every call — `OrderedMap.Set`, `MoveToBottom`,
-`SetAfter` — roughly doubles once the list no longer fits in L2; that is
-pointer chasing, not an algorithmic change.
+**Scaling with size is mostly flat.** Most per-op rows grow 30–60 % from
+500 to 50,000 entries. Rows that touch list pointers on every call —
+`OrderedMap.Set`, `MoveToBottom`, `SetAfter` — are sensitive to where the
+allocator happened to place the nodes once the list no longer fits in L2:
+the same `MoveToBottom/50000` measured 12 ns in this run and ~30 ns in
+another run of the same session. That is pointer chasing, not an
+algorithmic change.
 
-**LFU `Get` is allocation-free.** `CacheMap/LFU` serves a `Get` in 60–95 ns
-with zero allocations, against 16–21 ns for LRU. Every LFU read moves the
-key to the frequency `f+1` bucket; `BucketMap` takes that bucket from a
-pool of warm buckets (`DefaultWarmBuckets` = 16, `WarmUp(n)` to grow it)
-and moves the key's list node with it (`OrderedMap.detach` /
-`attach_bottom`), so nothing is allocated. Before the pool an LFU `Get`
-was 170–210 ns and ~90 B; with the pool but a fresh node, 110–160 ns and
-32 B. `Update`, which does not bump, costs 19–29 ns under LFU, and `Bump`
-on a bare `BucketMap` is 72–101 ns. The only LFU operation that still
-allocates is inserting a *new* key (`SetEvicting`, one node).
+**LFU costs about what LRU costs.** `CacheMap/LFU` serves a `Get` in
+13–18 ns against 10–17 ns for LRU, with zero allocations. Every LFU read
+moves the key to the frequency `f+1` bucket. `BucketMap` keeps one map from
+key to list node; each node points at its bucket, and the buckets form a
+list sorted by index, so moving a key to the neighbouring bucket is a few
+pointer writes with no hashing at all. A key that is alone in its bucket
+takes the bucket along (it is renumbered in place), and buckets that empty
+out go back to a pool (`DefaultWarmBuckets` = 16, `WarmUp(n)` to grow it).
+`Bump` on a bare `BucketMap` is 14–19 ns. History of an LFU `Get`, each
+measured against the build before it: 170–210 ns with a fresh bucket per
+move, 110–160 ns with pooled buckets, 60–95 ns with the node moved between
+per-bucket hash maps, and 13–18 ns with the linked buckets above (−72 to
+−77 % against the previous build, same session).
 
-**What a mutex costs uncontended.** `RLock`/`RUnlock` adds ~4 ns to reads
-and `Lock`/`Unlock` ~12 ns to writes (`OrderedMap` vs `OrderedMapLocked`);
-the cache's lock adds ~10–12 ns to both `Get` and `Set`.
+**Evicting inserts allocate nothing.** When the cache is full, `Set` of a
+new key evicts one entry and reuses its node for the new key, so
+`SetEvicting` is 47–60 ns (LRU) and 53–70 ns (LFU) with zero allocations;
+against the previous build in the same session that is −37 % (LRU) and
+−62 % (LFU), down from one 32-byte node per insert. The only operations
+that still allocate are inserts into a cache that is not yet full.
+
+**One lookup per cache operation.** `CacheMap.Get` and `Set` work on the
+backing map's nodes directly instead of going through its public methods:
+an LRU `Get` used to look its key up twice (read, then move) and a `Set` on
+an existing key three times. Against the previous build in the same
+session: LRU `Get` −22 to −29 %, LRU `Set` −36 to −38 %.
+
+**What a mutex costs uncontended.** `RLock`/`RUnlock` adds ~5 ns to reads
+and `Lock`/`Unlock` ~12–14 ns to writes (`OrderedMap` vs `OrderedMapLocked`);
+the cache's lock adds ~12–15 ns to both `Get` and `Set`.
 
 **Sharding pays off only under contention.** Single-threaded, the sharded
-cache is *slower* than the locked cache (`Get` 37–43 ns vs 28–30 ns; `Set`
-76–107 ns vs 30–35 ns): that is the default `maphash` on the key plus the
-extra indirection. With 24 goroutines it flips — the `Parallel` rows show
-`ShardedCacheMap/LRU` at 43–47 ns per op versus `CacheMapLocked/LRU` at
-66–70 ns (1.5×), and 80–92 ns versus 179–224 ns for LFU (2.4×). For
-integer or otherwise cheap keys, passing a custom `Hash` in the config
-removes most of the single-threaded penalty. In per-shard mode `Top`,
-`Bottom` and `Len` visit every shard (~170–200 ns for 16 shards).
+cache is *slower* than the locked cache (`Get` 29–35 ns vs 25–30 ns; `Set`
+43–64 ns vs 25–30 ns): that is the default `maphash` on the key plus the
+extra indirection. The `Set` gap is wider than the `Get` gap partly because
+splitting the capacity across shards and hashing keys unevenly means a
+"full" sharded cache holds 95–99 % of the keys the benchmark cycles
+through, so some of those `Set`s evict. With 24 goroutines it flips — the
+`Parallel` rows show `ShardedCacheMap/LRU` at 39–42 ns per op versus
+`CacheMapLocked/LRU` at 85–88 ns (2.1×), and 34–38 ns versus 82–92 ns for
+LFU (2.4×). For integer or otherwise cheap keys, passing a custom `Hash` in
+the config removes most of the single-threaded penalty. In per-shard mode
+`Top`, `Bottom` and `Len` visit every shard (~170–210 ns for 16 shards).
 
 **Global order: exact eviction for one shared lock.** `ShardedCacheMapGlobal`
 keeps a single `CacheMap[Key, struct{}]` as the index of every key and uses
 the shards only for values. Eviction is then the true global LRU/LFU,
-`Top` is exact and cheap (46 ns vs ~197 ns per-shard) and `Len` is O(1)
-(11 ns vs ~171 ns). The price is the lock every operation takes: a
-single-threaded `Get` goes from 43 to 67 ns (LRU), and under 24-goroutine
-contention the `Parallel` row is 157–174 ns against 43–47 ns per-shard for
-LRU and 211–288 ns against 80–92 ns for LFU — about 3.5× slower, and
-roughly 2.4× slower than a plain locked `CacheMap` because each operation
-now takes the index lock *and* a shard lock. `SetEvicting` also pays for
-two structures (200–248 ns vs 76–107 ns). Choose global order when hit
-rate or exact `Top`/`Len` matter more than throughput; per-shard order for
-the opposite.
+`Top` is exact and cheap (36 ns vs ~210 ns per-shard) and `Len` is O(1)
+(11 ns vs ~173 ns). The price is the lock every operation takes: a
+single-threaded `Get` goes from 29–33 to 39–48 ns (LRU), and under
+24-goroutine contention the `Parallel` row is 196–227 ns against 39–42 ns
+per-shard for LRU and 200–223 ns against 34–38 ns for LFU — about 5× slower,
+and more than 2× slower than a plain locked `CacheMap` because each
+operation now takes the index lock *and* a shard lock. `SetEvicting` also
+pays for two structures (122–162 ns vs 56–80 ns). Choose global order when
+hit rate or exact `Top`/`Len` matter more than throughput; per-shard order
+for the opposite.
 
-**`ShardedMap` is close to a plain locked map.** 21–26 ns `Get`, 26–41 ns
-`Set`, 32–36 ns `Modify`, 47–51 ns per op with 24 goroutines. `Range` is
-~27–32 ns/entry, dominated by the per-shard snapshot copy (24 B/entry).
+**`ShardedMap` is close to a plain locked map.** 16–19 ns `Get`, 24–27 ns
+`Set`, 26–28 ns `Modify`, 49–55 ns per op with 24 goroutines. `Range` is
+~19–28 ns/entry, dominated by the per-shard snapshot copy (24 B/entry).
 
 **Threaded populate: partition first, then one lock per shard.**
 `Populate(entries, threads)` groups the input by shard and fills each shard
 under a single lock acquisition. It is not faster than the plain sequential
-loop on a bare `ShardedMap` (98–128 vs 50–66 ns/entry): building the
+loop on a bare `ShardedMap` (69–110 vs 46–50 ns/entry): building the
 per-shard partitions allocates ~95 B/entry, more than the ~25 ns insert it
-parallelises. It does pay where the per-entry work is heavier —
-`ShardedCacheMap/LFU/PopulateThreaded` is 81–122 ns/entry against
-136–160 ns/entry sequential, and LRU roughly breaks even. Use the threaded
-form for large batches into a cache, the plain form for a bare map.
+parallelises. Now that inserting into an LFU cache is cheap, the same holds
+for the caches: `ShardedCacheMap/LRU/PopulateThreaded` is 54–75 ns/entry
+against 42–53 ns sequential, and LFU roughly breaks even (70–117 vs
+76–110 ns/entry, winning only on the largest batch). Prefer the plain form
+unless batches are very large.
 
 **`Clear` keeps its storage.** `OrderedMap.Clear` empties the hash map in
 place instead of allocating a new one, so a map that is cleared and
 refilled (a benchmark iteration, or a pooled bucket) does not re-grow its
-table: `OrderedMap/Populate` is 22–41 ns/entry and 32 B/entry (one node).
+table: `OrderedMap/Populate` is 23–33 ns/entry and 32 B/entry (one node).
+A `BucketMap` entry costs ~95 B/entry to populate: a 48-byte node (key,
+value, bucket pointer, two list pointers) plus the index growing.
 
-**TTL is cheap.** `SetWithTTL` adds ~20–25 ns over `Set` (a map write and
-`time.Now()`), a `Get` on a key with a TTL adds ~6–14 ns for the deadline
-check, and `DeleteExpired` sweeps at 30–60 ns/entry.
+**TTL is cheap.** `SetWithTTL` adds ~15–25 ns over `Set` (a map write and
+`time.Now()`), a `Get` on a key with a TTL adds ~6–12 ns for the deadline
+check, and `DeleteExpired` sweeps at 29–53 ns/entry.
 
 ## Turning the collector off
 
@@ -93,39 +119,40 @@ check, and `DeleteExpired` sweeps at 30–60 ns/entry.
 process. `BenchmarkGCEnabledVsDisabled` measures whether that is worth it:
 the same cache-churn workload (256-byte values, every iteration allocates
 one and evicts another) with the collector on and off, at 10,000 and
-100,000 entries. `-benchtime=200ms`, three runs each.
+100,000 entries. `-benchtime=200ms`, three runs each. Since evicting
+inserts reuse the evicted node, the 256-byte value is the workload's only
+allocation.
 
 | Capacity | Collector | ns/op (3 runs) | GC cycles | Pause total | Heap at the end |
 |---|---|---:|---:|---:|---:|
-| 10,000 | on | 192 / 190 / 189 | ~89 | 4–10 ms | 5–7 MB |
-| 10,000 | **off** | 224 / 180 / 156 | 0 | 0 | **293–451 MB** |
-| 100,000 | on | 188 / 195 / 205 | ~11 | 0–0.5 ms | 41–68 MB |
-| 100,000 | **off** | 227 / 162 / 141 | 0 | 0 | **410–536 MB** |
+| 10,000 | on | 155 / 151 / 166 | ~90 | 4.5–5.8 ms | 5–8 MB |
+| 10,000 | **off** | 145 / 143 / 141 | 0 | 0 | **428–445 MB** |
+| 100,000 | on | 127 / 125 / 138 | ~14 | 0 ms | 43–52 MB |
+| 100,000 | **off** | 137 / 130 / 123 | 0 | 0 | **479–583 MB** |
 
-Turning the collector off is **not reliably faster**. The steady-state gain
-is at best ~10–25 % once the heap has finished growing, the first run is
-*slower* than leaving the collector on (the allocator is faulting in new
-pages instead of reusing swept ones), and the spread across runs
-(141–227 ns) dwarfs the difference. What it does buy is the pause column:
-exactly zero, against 4–10 ms per 200 ms of work at 10,000 entries. That is
-the real reason to use it — a bounded latency-critical section — and it
-costs hundreds of megabytes of heap that are never given back.
+Turning the collector off is **not reliably faster**. At 10,000 entries it
+gains 5–15 %, at 100,000 the two are indistinguishable, and the spread
+across runs (123–166 ns) is as large as any difference. What it does buy is
+the pause column: exactly zero, against 4.5–5.8 ms per 200 ms of work at
+10,000 entries. That is the real reason to use it — a bounded
+latency-critical section — and it costs hundreds of megabytes of heap that
+are never given back.
 
 `BenchmarkGCPercent` shows the middle lever, which is the better one for
 almost every case: raising `GOGC` rather than switching the collector off.
 
-| GOGC | ns/op | GC cycles | Heap at the end |
+| GOGC | ns/op (3 runs) | GC cycles | Heap at the end |
 |---|---:|---:|---:|
-| 100 (default) | 161 / 153 | 18–20 | 56–61 MB |
-| 400 | 137 / 137 | 5–6 | 103–130 MB |
-| 800 | 149 / 170 | 2 | 130–178 MB |
+| 100 (default) | 124 / 121 / 135 | 13–15 | 48–65 MB |
+| 400 | 107 / 107 / 116 | 4 | 104–148 MB |
+| 800 | 112 / 107 / 118 | 1–2 | 60–307 MB |
 
 `GOGC=400` gets most of the available speed-up for a bounded heap, and
 unlike disabling the collector it keeps the program's memory use finite.
 
 `BenchmarkSweeperOverhead` measures the manager's own background sweep on a
-cache with no TTLs, where every sweep finds nothing: 193–226 ns/op with no
-sweeper, 218–220 ns/op sweeping every millisecond, 218–223 ns/op every
+cache with no TTLs, where every sweep finds nothing: 145–158 ns/op with no
+sweeper, 149–164 ns/op sweeping every millisecond, 145–158 ns/op every
 100 ms. At any sane interval the sweeper is lost in the noise.
 
 ## Reproducing
@@ -151,7 +178,7 @@ report was generated from is in `benchmark_raw.txt` next to it.
 
 ## Environment
 
-- Date: 2026-09-17
+- Date: 2026-10-14
 - go version go1.26.2 windows/amd64
 - OS/arch: windows/amd64
 - CPU: Intel(R) Core(TM) Ultra 9 275HX
@@ -188,230 +215,230 @@ report was generated from is in `benchmark_raw.txt` next to it.
 
 | Operation | 500 | 1,000 | 5,000 | 10,000 | 50,000 | B/op | allocs/op |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Populate \* | 22.2 | 27.6 | 36.0 | 37.3 | 41.2 | 32.2 | 1.00 |
-| Get | 8.29 | 9.15 | 10.2 | 10.7 | 12.6 | 0.00 | 0.00 |
-| Has | 7.87 | 8.42 | 9.71 | 10.1 | 11.9 | 0.00 | 0.00 |
-| Set | 10.8 | 12.6 | 13.8 | 14.3 | 30.6 | 0.00 | 0.00 |
-| Update | 8.53 | 9.33 | 10.4 | 10.7 | 13.2 | 0.00 | 0.00 |
-| PopAll \* | 27.5 | 32.6 | 34.8 | 37.9 | 41.2 | 0.00 | 0.00 |
-| DeleteAll \* | 27.2 | 36.1 | 37.5 | 39.6 | 40.1 | 0.00 | 0.00 |
-| MoveToBottom | 9.98 | 11.4 | 12.7 | 27.5 | 30.6 | 0.00 | 0.00 |
-| SetTop | 10.6 | 12.6 | 13.7 | 14.2 | 30.1 | 0.00 | 0.00 |
-| SetAfter | 16.4 | 18.7 | 21.6 | 22.6 | 38.9 | 0.00 | 0.00 |
-| Rotate | 48.4 | 49.5 | 64.7 | 66.6 | 76.6 | 32.0 | 1.00 |
-| Top | 2.86 | 2.85 | 2.85 | 2.85 | 2.86 | 0.00 | 0.00 |
-| PopTopAll \* | 16.2 | 16.9 | 20.5 | 19.9 | 26.9 | 0.00 | 0.00 |
-| Walk \* | 17.5 | 20.1 | 22.2 | 23.0 | 25.7 | 0.00 | 0.00 |
+| Populate \* | 23.2 | 24.1 | 23.4 | 25.7 | 32.9 | 32.1 | 1.00 |
+| Get | 5.85 | 6.29 | 7.63 | 7.31 | 8.91 | 0.00 | 0.00 |
+| Has | 5.28 | 5.86 | 6.36 | 6.60 | 8.37 | 0.00 | 0.00 |
+| Set | 8.77 | 9.22 | 10.7 | 11.2 | 13.6 | 0.00 | 0.00 |
+| Update | 5.73 | 6.32 | 7.10 | 7.62 | 9.76 | 0.00 | 0.00 |
+| PopAll \* | 16.2 | 20.8 | 23.2 | 23.2 | 30.8 | 0.00 | 0.00 |
+| DeleteAll \* | 16.1 | 19.8 | 23.1 | 23.1 | 30.5 | 0.00 | 0.00 |
+| MoveToBottom | 8.61 | 9.17 | 9.63 | 10.0 | 12.4 | 0.00 | 0.00 |
+| SetTop | 9.06 | 10.3 | 10.3 | 10.7 | 12.4 | 0.00 | 0.00 |
+| SetAfter | 15.0 | 14.1 | 17.2 | 18.6 | 23.5 | 0.00 | 0.00 |
+| Rotate | 33.6 | 40.0 | 46.2 | 46.8 | 64.1 | 32.0 | 1.00 |
+| Top | 1.58 | 1.60 | 1.59 | 1.59 | 1.58 | 0.00 | 0.00 |
+| PopTopAll \* | 12.1 | 14.2 | 16.3 | 16.4 | 24.9 | 0.00 | 0.00 |
+| Walk \* | 13.9 | 15.5 | 16.7 | 17.6 | 21.2 | 0.00 | 0.00 |
 
 ### OrderedMapLocked
 
 | Operation | 500 | 1,000 | 5,000 | 10,000 | 50,000 | B/op | allocs/op |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Populate \* | 35.6 | 36.7 | 45.0 | 51.9 | 52.2 | 32.2 | 1.00 |
-| Get | 12.5 | 13.3 | 14.4 | 14.8 | 16.9 | 0.00 | 0.00 |
-| Has | 12.2 | 12.9 | 14.1 | 14.3 | 16.1 | 0.00 | 0.00 |
-| Set | 24.2 | 25.2 | 26.3 | 26.8 | 32.2 | 0.00 | 0.00 |
-| Update | 21.5 | 21.8 | 22.4 | 22.4 | 24.4 | 0.00 | 0.00 |
-| PopAll \* | 33.6 | 37.3 | 39.2 | 40.2 | 44.5 | 0.00 | 0.00 |
-| DeleteAll \* | 31.0 | 33.0 | 38.1 | 40.2 | 46.7 | 0.00 | 0.00 |
-| Parallel | 38.2 | 42.0 | 46.9 | 49.2 | 57.7 | 0.00 | 0.00 |
+| Populate \* | 36.4 | 35.8 | 36.2 | 38.7 | 45.1 | 32.2 | 1.00 |
+| Get | 11.9 | 12.1 | 12.5 | 12.6 | 13.9 | 0.00 | 0.00 |
+| Has | 11.9 | 11.9 | 12.1 | 12.1 | 13.2 | 0.00 | 0.00 |
+| Set | 23.2 | 23.5 | 23.8 | 24.2 | 25.3 | 0.00 | 0.00 |
+| Update | 21.5 | 21.6 | 23.1 | 21.9 | 22.9 | 0.00 | 0.00 |
+| PopAll \* | 28.9 | 29.6 | 32.3 | 32.9 | 40.9 | 0.00 | 0.00 |
+| DeleteAll \* | 28.5 | 34.7 | 32.2 | 33.0 | 39.9 | 0.00 | 0.00 |
+| Parallel | 49.7 | 50.4 | 51.6 | 51.4 | 54.3 | 0.00 | 0.00 |
 
 ### BucketMap
 
 | Operation | 500 | 1,000 | 5,000 | 10,000 | 50,000 | B/op | allocs/op |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Populate \* | 76.0 | 74.0 | 80.4 | 104 | 116 | 79.8 | 1.01 |
-| Get | 37.1 | 38.3 | 41.0 | 41.5 | 51.2 | 0.00 | 0.00 |
-| Has | 8.00 | 8.53 | 9.61 | 10.2 | 11.9 | 0.00 | 0.00 |
-| Set | 27.5 | 29.4 | 32.3 | 34.2 | 43.3 | 0.00 | 0.00 |
-| Update | 38.2 | 39.1 | 42.8 | 42.9 | 52.2 | 0.00 | 0.00 |
-| PopAll \* | 80.6 | 84.0 | 87.3 | 87.7 | 112 | 0.00 | 0.00 |
-| DeleteAll \* | 79.2 | 83.4 | 87.0 | 67.8 | 99.8 | 0.00 | 0.00 |
-| Bump | 71.9 | 78.5 | 93.2 | 97.7 | 101 | 0.00 | 0.00 |
-| SetFarBucket | 49.6 | 68.9 | 85.2 | 91.2 | 99.1 | 0.00 | 0.00 |
-| Top | 4.14 | 4.20 | 4.12 | 4.15 | 4.13 | 0.00 | 0.00 |
-| GetBucketIndex | 5.08 | 5.28 | 5.86 | 6.21 | 7.89 | 0.00 | 0.00 |
-| PopTopAll \* | 29.6 | 32.4 | 36.8 | 34.8 | 49.2 | 0.00 | 0.00 |
-| GetBucketIndices | 268 | 267 | 278 | 308 | 244 | 128 | 1.00 |
+| Populate \* | 63.2 | 64.5 | 59.7 | 63.2 | 71.0 | 95.3 | 1.01 |
+| Get | 5.55 | 6.24 | 6.88 | 7.14 | 8.94 | 0.00 | 0.00 |
+| Has | 5.06 | 5.56 | 6.02 | 6.33 | 7.84 | 0.00 | 0.00 |
+| Set | 7.82 | 7.82 | 8.86 | 9.16 | 11.1 | 0.00 | 0.00 |
+| Update | 5.74 | 6.64 | 7.22 | 7.52 | 9.27 | 0.00 | 0.00 |
+| PopAll \* | 23.6 | 26.3 | 30.4 | 29.2 | 33.9 | 0.00 | 0.00 |
+| DeleteAll \* | 23.3 | 26.4 | 29.8 | 33.4 | 34.4 | 0.00 | 0.00 |
+| Bump | 14.0 | 16.1 | 16.8 | 16.7 | 19.4 | 0.00 | 0.00 |
+| SetFarBucket | 13.9 | 15.4 | 16.1 | 16.8 | 20.1 | 0.00 | 0.00 |
+| Top | 1.75 | 1.75 | 1.75 | 1.75 | 1.76 | 0.00 | 0.00 |
+| GetBucketIndex | 5.47 | 5.83 | 6.46 | 6.78 | 8.41 | 0.00 | 0.00 |
+| PopTopAll \* | 16.1 | 18.2 | 22.1 | 31.7 | 30.4 | 0.00 | 0.00 |
+| GetBucketIndices | 91.6 | 79.0 | 139 | 105 | 56.3 | 128 | 1.00 |
 
 ### BucketMapLocked
 
 | Operation | 500 | 1,000 | 5,000 | 10,000 | 50,000 | B/op | allocs/op |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Populate \* | 87.0 | 88.2 | 83.6 | 88.3 | 95.2 | 79.7 | 1.01 |
-| Get | 29.2 | 30.0 | 32.8 | 34.7 | 42.0 | 0.00 | 0.00 |
-| Has | 11.9 | 12.0 | 12.0 | 12.2 | 13.3 | 0.00 | 0.00 |
-| Set | 45.8 | 46.6 | 49.6 | 51.1 | 56.2 | 0.00 | 0.00 |
-| Update | 36.1 | 37.7 | 40.4 | 43.3 | 50.3 | 0.00 | 0.00 |
-| PopAll \* | 63.1 | 66.8 | 69.5 | 71.0 | 96.8 | 0.00 | 0.00 |
-| DeleteAll \* | 63.3 | 66.3 | 71.8 | 71.7 | 97.3 | 0.00 | 0.00 |
-| Parallel | 98.8 | 119 | 108 | 116 | 140 | 0.00 | 0.00 |
+| Populate \* | 75.2 | 78.5 | 73.4 | 78.5 | 82.9 | 95.3 | 1.01 |
+| Get | 11.9 | 12.2 | 13.6 | 12.4 | 13.8 | 0.00 | 0.00 |
+| Has | 11.8 | 11.9 | 13.0 | 12.0 | 13.0 | 0.00 | 0.00 |
+| Set | 22.0 | 22.1 | 24.7 | 22.2 | 23.3 | 0.00 | 0.00 |
+| Update | 21.2 | 21.4 | 24.3 | 21.6 | 22.8 | 0.00 | 0.00 |
+| PopAll \* | 34.5 | 35.2 | 41.6 | 41.2 | 43.5 | 0.00 | 0.00 |
+| DeleteAll \* | 34.0 | 35.7 | 38.6 | 40.0 | 43.6 | 0.00 | 0.00 |
+| Parallel | 52.3 | 52.1 | 58.0 | 52.2 | 60.2 | 0.00 | 0.00 |
 
 ### CacheMap — LRU
 
 | Operation | 500 | 1,000 | 5,000 | 10,000 | 50,000 | B/op | allocs/op |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Populate \* | 33.6 | 33.2 | 33.5 | 38.5 | 42.3 | 32.2 | 1.00 |
-| Get | 15.6 | 16.2 | 17.6 | 18.1 | 20.8 | 0.00 | 0.00 |
-| Has | 7.63 | 8.31 | 9.09 | 9.39 | 11.4 | 0.00 | 0.00 |
-| Set | 20.4 | 21.7 | 22.3 | 22.8 | 26.2 | 0.00 | 0.00 |
-| Update | 8.46 | 9.66 | 10.2 | 10.6 | 12.7 | 0.00 | 0.00 |
-| PopAll \* | 20.0 | 24.9 | 27.6 | 26.9 | 34.9 | 0.00 | 0.00 |
-| DeleteAll \* | 18.4 | 22.4 | 25.7 | 25.1 | 32.4 | 0.00 | 0.00 |
-| SetEvicting | 75.0 | 79.4 | 88.7 | 91.7 | 90.8 | 32.0 | 1.00 |
-| SetOrGet | 14.8 | 15.8 | 17.0 | 17.5 | 20.3 | 0.00 | 0.00 |
-| SetWithTTL | 35.4 | 37.2 | 41.6 | 43.2 | 51.6 | 0.00 | 0.00 |
-| GetWithTTL | 21.0 | 22.7 | 26.0 | 27.3 | 34.6 | 0.00 | 0.00 |
-| Top | 5.28 | 5.29 | 5.31 | 5.26 | 5.26 | 0.00 | 0.00 |
-| DeleteExpired \* | 30.7 | 35.9 | 35.2 | 34.3 | 45.0 | 0.00 | 0.00 |
+| Populate \* | 28.8 | 29.6 | 28.1 | 29.8 | 37.3 | 32.1 | 1.00 |
+| Get | 10.4 | 12.0 | 13.4 | 14.2 | 17.4 | 0.00 | 0.00 |
+| Has | 8.14 | 8.48 | 9.43 | 10.1 | 12.0 | 0.00 | 0.00 |
+| Set | 11.1 | 13.9 | 14.6 | 15.1 | 17.6 | 0.00 | 0.00 |
+| Update | 8.89 | 9.58 | 10.5 | 10.7 | 13.0 | 0.00 | 0.00 |
+| PopAll \* | 20.4 | 23.6 | 27.1 | 27.8 | 34.4 | 0.00 | 0.00 |
+| DeleteAll \* | 18.5 | 22.4 | 24.6 | 24.7 | 32.3 | 0.00 | 0.00 |
+| SetEvicting | 47.3 | 52.7 | 55.3 | 60.1 | 59.1 | 0.00 | 0.00 |
+| SetOrGet | 10.1 | 11.4 | 12.7 | 13.6 | 16.1 | 0.00 | 0.00 |
+| SetWithTTL | 26.3 | 29.7 | 32.8 | 34.4 | 42.7 | 0.00 | 0.00 |
+| GetWithTTL | 16.3 | 18.4 | 20.9 | 22.2 | 29.2 | 0.00 | 0.00 |
+| Top | 5.40 | 5.36 | 5.40 | 5.42 | 5.33 | 0.00 | 0.00 |
+| DeleteExpired \* | 28.8 | 36.9 | 34.2 | 34.9 | 47.4 | 0.00 | 0.00 |
 
 ### CacheMap — LFU
 
 | Operation | 500 | 1,000 | 5,000 | 10,000 | 50,000 | B/op | allocs/op |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Populate \* | 86.2 | 86.4 | 81.4 | 88.3 | 99.4 | 79.7 | 1.01 |
-| Get | 60.4 | 68.1 | 75.8 | 77.6 | 94.5 | 0.00 | 0.00 |
-| Has | 7.90 | 8.15 | 9.06 | 9.41 | 11.6 | 0.00 | 0.00 |
-| Set | 68.1 | 75.3 | 85.2 | 88.4 | 104 | 0.00 | 0.00 |
-| Update | 19.0 | 21.1 | 23.1 | 23.9 | 29.0 | 0.00 | 0.00 |
-| PopAll \* | 42.2 | 51.2 | 54.7 | 55.5 | 70.6 | 0.00 | 0.00 |
-| DeleteAll \* | 40.5 | 48.7 | 53.3 | 54.5 | 68.7 | 0.00 | 0.00 |
-| SetEvicting | 130 | 140 | 159 | 171 | 169 | 33.0 | 1.00 |
-| SetOrGet | 58.9 | 66.1 | 75.3 | 77.3 | 92.7 | 0.00 | 0.00 |
-| SetWithTTL | 83.4 | 92.2 | 105 | 110 | 138 | 1.00 | 0.00 |
-| GetWithTTL | 65.8 | 77.4 | 84.2 | 85.4 | 110 | 0.00 | 0.00 |
-| Top | 7.63 | 7.63 | 7.64 | 7.64 | 7.66 | 0.00 | 0.00 |
-| DeleteExpired \* | 43.1 | 50.1 | 60.2 | 47.7 | 62.6 | 0.00 | 0.00 |
+| Populate \* | 65.3 | 64.6 | 59.4 | 65.2 | 94.5 | 95.3 | 1.01 |
+| Get | 14.2 | 13.4 | 15.3 | 16.6 | 18.3 | 0.00 | 0.00 |
+| Has | 7.82 | 8.51 | 9.11 | 9.47 | 11.5 | 0.00 | 0.00 |
+| Set | 13.0 | 13.7 | 15.4 | 16.3 | 19.0 | 0.00 | 0.00 |
+| Update | 8.39 | 9.22 | 10.4 | 10.7 | 12.8 | 0.00 | 0.00 |
+| PopAll \* | 25.8 | 31.2 | 37.2 | 39.5 | 45.0 | 0.00 | 0.00 |
+| DeleteAll \* | 26.0 | 30.1 | 34.1 | 35.5 | 42.2 | 0.00 | 0.00 |
+| SetEvicting | 53.2 | 58.6 | 59.4 | 69.5 | 61.2 | 0.00 | 0.00 |
+| SetOrGet | 12.6 | 13.1 | 15.0 | 15.4 | 17.9 | 0.00 | 0.00 |
+| SetWithTTL | 28.2 | 32.8 | 36.0 | 38.4 | 44.8 | 0.00 | 0.00 |
+| GetWithTTL | 21.4 | 21.6 | 25.1 | 26.1 | 34.3 | 0.00 | 0.00 |
+| Top | 6.02 | 6.01 | 5.98 | 5.98 | 5.96 | 0.00 | 0.00 |
+| DeleteExpired \* | 37.8 | 32.5 | 50.6 | 41.3 | 52.5 | 0.00 | 0.00 |
 
 ### CacheMapLocked — LRU
 
 | Operation | 500 | 1,000 | 5,000 | 10,000 | 50,000 | B/op | allocs/op |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Populate \* | 47.0 | 49.0 | 49.3 | 51.6 | 58.3 | 32.2 | 1.00 |
-| Get | 27.8 | 28.4 | 30.4 | 29.8 | 30.1 | 0.00 | 0.00 |
-| Has | 13.8 | 14.0 | 15.4 | 15.1 | 15.6 | 0.00 | 0.00 |
-| Set | 30.3 | 31.0 | 33.5 | 33.0 | 34.8 | 0.00 | 0.00 |
-| Update | 23.2 | 27.1 | 26.5 | 24.6 | 24.5 | 0.00 | 0.00 |
-| PopAll \* | 30.9 | 32.1 | 40.3 | 45.6 | 52.8 | 0.00 | 0.00 |
-| DeleteAll \* | 36.6 | 41.8 | 43.5 | 43.9 | 52.2 | 0.00 | 0.00 |
-| SetEvicting | 107 | 114 | 130 | 131 | 129 | 32.0 | 1.00 |
-| SetOrGet | 33.1 | 35.0 | 36.2 | 36.5 | 38.6 | 0.00 | 0.00 |
-| SetWithTTL | 65.9 | 65.8 | 71.7 | 68.4 | 81.7 | 0.00 | 0.00 |
-| GetWithTTL | 44.0 | 46.7 | 47.4 | 48.0 | 53.8 | 0.00 | 0.00 |
-| Top | 22.9 | 23.0 | 22.9 | 23.0 | 22.9 | 0.00 | 0.00 |
-| DeleteExpired \* | 39.1 | 36.3 | 36.0 | 41.1 | 50.5 | 0.00 | 0.00 |
-| Parallel | 65.5 | 68.1 | 72.7 | 67.6 | 70.0 | 0.00 | 0.00 |
+| Populate \* | 40.2 | 41.8 | 43.6 | 44.1 | 50.8 | 32.2 | 1.00 |
+| Get | 25.0 | 26.7 | 28.9 | 29.6 | 29.6 | 0.00 | 0.00 |
+| Has | 14.5 | 14.7 | 15.7 | 15.5 | 16.3 | 0.00 | 0.00 |
+| Set | 24.6 | 25.2 | 29.1 | 28.6 | 26.7 | 0.00 | 0.00 |
+| Update | 23.1 | 23.3 | 27.3 | 27.1 | 27.0 | 0.00 | 0.00 |
+| PopAll \* | 33.4 | 34.2 | 36.6 | 37.2 | 43.9 | 0.00 | 0.00 |
+| DeleteAll \* | 32.7 | 33.8 | 37.4 | 36.4 | 44.2 | 0.00 | 0.00 |
+| SetEvicting | 59.5 | 61.8 | 66.5 | 67.7 | 64.8 | 0.00 | 0.00 |
+| SetOrGet | 24.3 | 24.4 | 27.3 | 28.0 | 26.0 | 0.00 | 0.00 |
+| SetWithTTL | 41.6 | 47.7 | 48.8 | 47.3 | 50.1 | 0.00 | 0.00 |
+| GetWithTTL | 27.9 | 28.4 | 31.5 | 31.7 | 38.0 | 0.00 | 0.00 |
+| Top | 23.0 | 23.0 | 23.0 | 22.9 | 22.9 | 0.00 | 0.00 |
+| DeleteExpired \* | 27.9 | 34.6 | 33.3 | 41.5 | 45.4 | 0.00 | 0.00 |
+| Parallel | 84.9 | 87.0 | 88.3 | 87.0 | 84.7 | 0.00 | 0.00 |
 
 ### CacheMapLocked — LFU
 
 | Operation | 500 | 1,000 | 5,000 | 10,000 | 50,000 | B/op | allocs/op |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Populate \* | 128 | 128 | 127 | 130 | 138 | 79.9 | 1.01 |
-| Get | 106 | 113 | 130 | 120 | 144 | 0.00 | 0.00 |
-| Has | 15.8 | 16.9 | 18.8 | 19.4 | 21.9 | 0.00 | 0.00 |
-| Set | 107 | 116 | 122 | 124 | 150 | 0.00 | 0.00 |
-| Update | 46.0 | 49.7 | 52.3 | 53.2 | 60.8 | 0.00 | 0.00 |
-| PopAll \* | 69.2 | 73.1 | 74.5 | 79.1 | 93.4 | 0.00 | 0.00 |
-| DeleteAll \* | 64.4 | 68.7 | 71.6 | 76.9 | 90.6 | 0.00 | 0.00 |
-| SetEvicting | 177 | 192 | 225 | 227 | 221 | 33.0 | 1.00 |
-| SetOrGet | 96.4 | 105 | 111 | 117 | 145 | 0.00 | 0.00 |
-| SetWithTTL | 132 | 142 | 152 | 163 | 206 | 2.00 | 0.00 |
-| GetWithTTL | 107 | 115 | 121 | 130 | 178 | 0.00 | 0.00 |
-| Top | 25.3 | 25.3 | 25.3 | 25.3 | 25.2 | 0.00 | 0.00 |
-| DeleteExpired \* | 44.9 | 54.5 | 54.4 | 65.6 | 72.0 | 0.00 | 0.00 |
-| Parallel | 179 | 178 | 192 | 202 | 224 | 3.00 | 0.00 |
+| Populate \* | 78.4 | 84.2 | 78.4 | 84.6 | 112 | 95.3 | 1.01 |
+| Get | 26.5 | 26.8 | 29.0 | 27.1 | 29.2 | 0.00 | 0.00 |
+| Has | 13.8 | 14.2 | 15.2 | 14.5 | 16.7 | 0.00 | 0.00 |
+| Set | 25.8 | 26.0 | 28.6 | 26.7 | 29.7 | 0.00 | 0.00 |
+| Update | 23.2 | 23.4 | 25.8 | 23.8 | 25.4 | 0.00 | 0.00 |
+| PopAll \* | 36.2 | 41.1 | 42.7 | 53.9 | 53.4 | 0.00 | 0.00 |
+| DeleteAll \* | 34.4 | 38.6 | 39.5 | 50.8 | 50.9 | 0.00 | 0.00 |
+| SetEvicting | 58.7 | 62.4 | 67.0 | 71.6 | 68.3 | 0.00 | 0.00 |
+| SetOrGet | 25.9 | 26.1 | 28.5 | 26.5 | 29.7 | 0.00 | 0.00 |
+| SetWithTTL | 42.3 | 45.1 | 46.8 | 47.5 | 53.5 | 0.00 | 0.00 |
+| GetWithTTL | 29.2 | 32.0 | 32.6 | 32.7 | 40.9 | 0.00 | 0.00 |
+| Top | 22.9 | 23.0 | 22.9 | 23.0 | 23.0 | 0.00 | 0.00 |
+| DeleteExpired \* | 32.8 | 32.1 | 46.2 | 37.8 | 52.2 | 0.00 | 0.00 |
+| Parallel | 88.2 | 91.2 | 87.2 | 82.0 | 91.9 | 0.00 | 0.00 |
 
 ### ShardedCacheMap — LRU
 
 | Operation | 500 | 1,000 | 5,000 | 10,000 | 50,000 | B/op | allocs/op |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Populate \* | 52.0 | 52.0 | 51.5 | 66.5 | 82.8 | 32.3 | 1.00 |
-| Get | 41.6 | 41.2 | 43.0 | 43.2 | 37.4 | 0.00 | 0.00 |
-| Has | 19.4 | 18.9 | 19.3 | 25.8 | 33.9 | 0.00 | 0.00 |
-| Set | 76.2 | 79.8 | 88.9 | 94.5 | 107 | 12.0 | 0.00 |
-| Update | 34.0 | 34.6 | 36.7 | 37.2 | 43.4 | 0.00 | 0.00 |
-| PopAll \* | 51.8 | 50.9 | 52.8 | 53.7 | 62.2 | 0.00 | 0.00 |
-| DeleteAll \* | 36.6 | 36.2 | 36.3 | 37.2 | 49.3 | 0.00 | 0.00 |
-| SetEvicting | 85.6 | 88.2 | 103 | 140 | 144 | 32.0 | 1.00 |
-| SetOrGet | 80.2 | 79.2 | 80.2 | 85.6 | 96.1 | 12.0 | 0.00 |
-| SetWithTTL | 109 | 111 | 123 | 126 | 168 | 15.0 | 0.00 |
-| Top | 197 | 198 | 197 | 197 | 197 | 0.00 | 0.00 |
-| Len | 171 | 171 | 171 | 171 | 171 | 0.00 | 0.00 |
-| PopulateThreaded \* | 90.6 | 76.0 | 65.5 | 69.5 | 66.8 | 79.6 | 1.01 |
-| Parallel | 43.5 | 41.9 | 44.5 | 46.1 | 47.2 | 0.00 | 0.00 |
+| Populate \* | 43.5 | 42.5 | 42.2 | 44.1 | 53.3 | 31.9 | 0.99 |
+| Get | 28.9 | 29.1 | 28.6 | 29.6 | 32.6 | 0.00 | 0.00 |
+| Has | 19.6 | 19.3 | 19.6 | 19.9 | 23.7 | 0.00 | 0.00 |
+| Set | 43.7 | 42.7 | 45.8 | 45.3 | 63.0 | 0.00 | 0.00 |
+| Update | 26.7 | 26.6 | 27.4 | 27.7 | 30.1 | 0.00 | 0.00 |
+| PopAll \* | 37.8 | 37.2 | 38.3 | 37.7 | 54.2 | 0.00 | 0.00 |
+| DeleteAll \* | 36.1 | 35.4 | 35.7 | 36.4 | 49.8 | 0.00 | 0.00 |
+| SetEvicting | 56.1 | 60.0 | 72.3 | 74.9 | 73.5 | 0.00 | 0.00 |
+| SetOrGet | 42.7 | 41.7 | 48.3 | 44.3 | 63.6 | 0.00 | 0.00 |
+| SetWithTTL | 61.8 | 62.7 | 68.6 | 77.8 | 110 | 0.00 | 0.00 |
+| Top | 211 | 211 | 211 | 211 | 210 | 0.00 | 0.00 |
+| Len | 174 | 173 | 174 | 171 | 174 | 0.00 | 0.00 |
+| PopulateThreaded \* | 74.7 | 62.5 | 54.3 | 55.7 | 63.4 | 79.4 | 1.00 |
+| Parallel | 42.0 | 40.1 | 39.2 | 39.1 | 40.5 | 0.00 | 0.00 |
 
 ### ShardedCacheMap — LFU
 
 | Operation | 500 | 1,000 | 5,000 | 10,000 | 50,000 | B/op | allocs/op |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Populate \* | 136 | 147 | 145 | 151 | 160 | 80.1 | 1.01 |
-| Get | 115 | 116 | 125 | 123 | 158 | 0.00 | 0.00 |
-| Has | 27.7 | 28.3 | 29.0 | 29.4 | 33.7 | 0.00 | 0.00 |
-| Set | 153 | 166 | 166 | 173 | 222 | 14.0 | 0.00 |
-| Update | 54.5 | 56.2 | 58.2 | 58.8 | 71.4 | 0.00 | 0.00 |
-| PopAll \* | 89.5 | 93.1 | 89.6 | 90.3 | 111 | 0.00 | 0.00 |
-| DeleteAll \* | 87.5 | 89.7 | 87.7 | 112 | 110 | 0.00 | 0.00 |
-| SetEvicting | 190 | 201 | 235 | 241 | 251 | 33.0 | 1.00 |
-| SetOrGet | 150 | 147 | 162 | 163 | 204 | 14.0 | 0.00 |
-| SetWithTTL | 193 | 196 | 209 | 227 | 302 | 19.0 | 0.00 |
-| Top | 200 | 200 | 200 | 199 | 199 | 0.00 | 0.00 |
-| Len | 171 | 171 | 171 | 171 | 171 | 0.00 | 0.00 |
-| PopulateThreaded \* | 122 | 107 | 104 | 94.8 | 81.4 | 127 | 1.02 |
-| Parallel | 92.0 | 85.0 | 77.3 | 80.4 | 83.4 | 2.00 | 0.00 |
+| Populate \* | 76.4 | 83.1 | 79.6 | 91.4 | 110 | 95.1 | 1.00 |
+| Get | 32.2 | 30.9 | 31.5 | 32.6 | 35.4 | 0.00 | 0.00 |
+| Has | 18.9 | 19.3 | 19.5 | 19.9 | 23.6 | 0.00 | 0.00 |
+| Set | 45.7 | 46.3 | 49.7 | 49.2 | 64.4 | 0.00 | 0.00 |
+| Update | 27.1 | 27.1 | 27.9 | 27.9 | 30.9 | 0.00 | 0.00 |
+| PopAll \* | 45.5 | 46.0 | 47.0 | 53.1 | 63.1 | 0.00 | 0.00 |
+| DeleteAll \* | 44.3 | 45.7 | 44.4 | 48.2 | 59.2 | 0.00 | 0.00 |
+| SetEvicting | 60.0 | 63.9 | 77.6 | 79.9 | 77.2 | 0.00 | 0.00 |
+| SetOrGet | 46.1 | 46.8 | 48.3 | 50.3 | 64.0 | 0.00 | 0.00 |
+| SetWithTTL | 66.6 | 68.0 | 71.7 | 81.2 | 117 | 0.00 | 0.00 |
+| Top | 211 | 209 | 211 | 212 | 210 | 0.00 | 0.00 |
+| Len | 174 | 174 | 173 | 172 | 174 | 0.00 | 0.00 |
+| PopulateThreaded \* | 96.5 | 89.9 | 89.1 | 117 | 70.1 | 143 | 1.01 |
+| Parallel | 37.8 | 35.5 | 34.4 | 33.7 | 34.8 | 0.00 | 0.00 |
 
 ### ShardedMap
 
 | Operation | 500 | 1,000 | 5,000 | 10,000 | 50,000 | B/op | allocs/op |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Populate \* | 49.8 | 52.3 | 48.2 | 64.6 | 65.5 | 47.5 | 0.01 |
-| Get | 21.4 | 21.3 | 22.8 | 23.1 | 26.0 | 0.00 | 0.00 |
-| Has | 20.8 | 20.3 | 22.3 | 22.9 | 25.9 | 0.00 | 0.00 |
-| Set | 25.8 | 27.4 | 28.6 | 29.3 | 40.7 | 0.00 | 0.00 |
-| Update | 29.7 | 30.0 | 31.8 | 32.3 | 42.0 | 0.00 | 0.00 |
-| PopAll \* | 39.8 | 40.5 | 42.4 | 42.1 | 49.4 | 0.00 | 0.00 |
-| DeleteAll \* | 40.2 | 39.6 | 42.2 | 42.0 | 49.2 | 0.00 | 0.00 |
-| SetOrGet | 25.5 | 25.1 | 26.1 | 26.6 | 29.4 | 0.00 | 0.00 |
-| Modify | 31.9 | 30.8 | 32.1 | 33.1 | 35.6 | 0.00 | 0.00 |
-| ShardIndex | 6.49 | 6.49 | 6.48 | 6.47 | 6.48 | 0.00 | 0.00 |
-| Len | 151 | 154 | 152 | 160 | 161 | 0.00 | 0.00 |
-| Range \* | 32.2 | 29.4 | 26.3 | 26.8 | 28.9 | 23.7 | 0.00 |
-| PopulateThreaded \* | 101 | 90.0 | 81.8 | 128 | 98.1 | 94.8 | 0.02 |
-| Parallel | 50.6 | 48.2 | 49.1 | 49.9 | 47.5 | 0.00 | 0.00 |
+| Populate \* | 49.2 | 49.5 | 45.8 | 47.5 | 46.5 | 47.5 | 0.01 |
+| Get | 16.4 | 15.7 | 16.3 | 16.8 | 19.3 | 0.00 | 0.00 |
+| Has | 15.2 | 14.3 | 15.5 | 15.7 | 17.8 | 0.00 | 0.00 |
+| Set | 23.7 | 24.3 | 24.5 | 24.7 | 26.5 | 0.00 | 0.00 |
+| Update | 27.6 | 28.5 | 27.8 | 28.2 | 29.5 | 0.00 | 0.00 |
+| PopAll \* | 30.4 | 31.2 | 32.0 | 30.9 | 38.1 | 0.00 | 0.00 |
+| DeleteAll \* | 30.4 | 30.5 | 30.7 | 31.2 | 36.5 | 0.00 | 0.00 |
+| SetOrGet | 23.9 | 23.8 | 24.5 | 24.2 | 24.6 | 0.00 | 0.00 |
+| Modify | 26.8 | 26.2 | 27.8 | 28.0 | 28.4 | 0.00 | 0.00 |
+| ShardIndex | 3.12 | 3.12 | 3.13 | 3.15 | 3.12 | 0.00 | 0.00 |
+| Len | 165 | 167 | 164 | 168 | 166 | 0.00 | 0.00 |
+| Range \* | 27.9 | 25.2 | 19.6 | 19.4 | 22.5 | 23.7 | 0.00 |
+| PopulateThreaded \* | 86.3 | 77.8 | 69.0 | 110 | 104 | 94.8 | 0.02 |
+| Parallel | 54.8 | 50.3 | 51.0 | 49.3 | 51.9 | 0.00 | 0.00 |
 
 ### ShardedCacheMapGlobal — LRU
 
 | Operation | 500 | 1,000 | 5,000 | 10,000 | 50,000 | B/op | allocs/op |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Populate \* | 96.4 | 101 | 104 | 130 | 137 | 72.0 | 1.01 |
-| Get | 59.6 | 62.6 | 66.4 | 66.9 | 74.3 | 0.00 | 0.00 |
-| Has | 17.2 | 17.5 | 19.7 | 19.6 | 21.4 | 0.00 | 0.00 |
-| Set | 72.8 | 75.3 | 79.0 | 77.8 | 91.3 | 0.00 | 0.00 |
-| Update | 56.7 | 57.5 | 60.8 | 60.6 | 66.8 | 0.00 | 0.00 |
-| PopAll \* | 81.0 | 86.2 | 88.4 | 90.1 | 107 | 0.00 | 0.00 |
-| DeleteAll \* | 78.1 | 77.0 | 83.2 | 81.5 | 98.3 | 0.00 | 0.00 |
-| SetEvicting | 200 | 213 | 235 | 248 | 238 | 25.0 | 1.00 |
-| SetOrGet | 60.0 | 64.6 | 68.2 | 68.8 | 81.5 | 0.00 | 0.00 |
-| SetWithTTL | 91.9 | 95.7 | 98.4 | 99.1 | 127 | 1.00 | 0.00 |
-| Top | 46.2 | 46.1 | 46.5 | 46.4 | 48.3 | 0.00 | 0.00 |
-| Len | 11.2 | 11.1 | 11.1 | 11.2 | 11.2 | 0.00 | 0.00 |
-| PopulateThreaded \* | 170 | 171 | 168 | 168 | 164 | 143 | 1.02 |
-| Parallel | 157 | 153 | 158 | 161 | 174 | 0.00 | 0.00 |
+| Populate \* | 89.5 | 94.0 | 94.0 | 96.0 | 102 | 71.9 | 1.01 |
+| Get | 39.4 | 44.4 | 43.3 | 41.9 | 47.7 | 0.00 | 0.00 |
+| Has | 14.1 | 14.4 | 15.6 | 14.9 | 17.0 | 0.00 | 0.00 |
+| Set | 48.1 | 50.4 | 52.7 | 50.8 | 58.7 | 0.00 | 0.00 |
+| Update | 48.6 | 53.5 | 51.9 | 50.6 | 55.5 | 0.00 | 0.00 |
+| PopAll \* | 65.5 | 71.4 | 70.9 | 72.2 | 89.6 | 0.00 | 0.00 |
+| DeleteAll \* | 63.1 | 66.3 | 69.0 | 70.3 | 84.4 | 0.00 | 0.00 |
+| SetEvicting | 122 | 134 | 144 | 158 | 157 | 1.00 | 0.00 |
+| SetOrGet | 40.2 | 45.1 | 44.7 | 42.1 | 47.9 | 0.00 | 0.00 |
+| SetWithTTL | 65.8 | 68.5 | 71.3 | 73.2 | 85.3 | 0.00 | 0.00 |
+| Top | 36.4 | 36.6 | 36.5 | 36.7 | 36.7 | 0.00 | 0.00 |
+| Len | 11.4 | 11.4 | 11.4 | 11.4 | 11.4 | 0.00 | 0.00 |
+| PopulateThreaded \* | 139 | 135 | 133 | 134 | 143 | 143 | 1.02 |
+| Parallel | 196 | 203 | 212 | 227 | 220 | 0.00 | 0.00 |
 
 ### ShardedCacheMapGlobal — LFU
 
 | Operation | 500 | 1,000 | 5,000 | 10,000 | 50,000 | B/op | allocs/op |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Populate \* | 198 | 204 | 203 | 212 | 212 | 120 | 1.02 |
-| Get | 126 | 133 | 149 | 141 | 183 | 0.00 | 0.00 |
-| Has | 17.1 | 18.6 | 19.1 | 19.7 | 21.5 | 0.00 | 0.00 |
-| Set | 142 | 164 | 156 | 164 | 193 | 0.00 | 0.00 |
-| Update | 72.7 | 75.8 | 79.7 | 79.8 | 92.5 | 0.00 | 0.00 |
-| PopAll \* | 115 | 112 | 122 | 121 | 148 | 0.00 | 0.00 |
-| DeleteAll \* | 110 | 114 | 123 | 119 | 145 | 0.00 | 0.00 |
-| SetEvicting | 283 | 303 | 339 | 345 | 357 | 28.0 | 1.00 |
-| SetOrGet | 126 | 133 | 140 | 148 | 185 | 0.00 | 0.00 |
-| SetWithTTL | 165 | 174 | 181 | 201 | 237 | 3.00 | 0.00 |
-| Top | 50.8 | 50.6 | 50.7 | 50.7 | 52.5 | 0.00 | 0.00 |
-| Len | 11.1 | 11.1 | 11.1 | 11.1 | 11.1 | 0.00 | 0.00 |
-| PopulateThreaded \* | 236 | 238 | 250 | 243 | 219 | 191 | 1.02 |
-| Parallel | 211 | 228 | 229 | 238 | 288 | 5.00 | 0.00 |
+| Populate \* | 131 | 137 | 131 | 138 | 159 | 127 | 1.02 |
+| Get | 41.4 | 41.9 | 46.6 | 43.2 | 50.0 | 0.00 | 0.00 |
+| Has | 20.3 | 14.3 | 15.6 | 14.8 | 16.3 | 0.00 | 0.00 |
+| Set | 49.7 | 50.0 | 54.5 | 53.5 | 60.7 | 0.00 | 0.00 |
+| Update | 48.1 | 48.9 | 51.5 | 54.6 | 58.1 | 0.00 | 0.00 |
+| PopAll \* | 76.7 | 77.1 | 84.2 | 78.5 | 92.0 | 0.00 | 0.00 |
+| DeleteAll \* | 76.4 | 74.9 | 84.2 | 78.7 | 89.1 | 0.00 | 0.00 |
+| SetEvicting | 124 | 131 | 142 | 158 | 162 | 1.00 | 0.00 |
+| SetOrGet | 40.5 | 41.0 | 44.4 | 42.6 | 48.1 | 0.00 | 0.00 |
+| SetWithTTL | 71.2 | 69.2 | 71.8 | 72.1 | 85.3 | 0.00 | 0.00 |
+| Top | 36.6 | 36.5 | 36.4 | 36.5 | 36.4 | 0.00 | 0.00 |
+| Len | 11.3 | 11.3 | 11.3 | 11.4 | 11.3 | 0.00 | 0.00 |
+| PopulateThreaded \* | 186 | 175 | 179 | 216 | 176 | 198 | 1.02 |
+| Parallel | 210 | 205 | 209 | 200 | 223 | 0.00 | 0.00 |

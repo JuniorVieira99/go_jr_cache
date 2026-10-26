@@ -7,25 +7,48 @@ import (
 
 // structs for the bucket map implementation
 
+// bucketNode is one entry of a bucket map. It sits in the list of the bucket
+// that holds it and points back at that bucket, so moving it to a
+// neighbouring bucket needs no lookup at all.
+type bucketNode[Key comparable, Value any] struct {
+	key    Key
+	value  Value
+	bucket *bucket[Key, Value]
+	prev   *bucketNode[Key, Value]
+	next   *bucketNode[Key, Value]
+}
+
 // Structure representing a single bucket within the bucket map.
-// Each bucket has an index and an ordered map of key-value pairs, ordered by
-// arrival: a key that moves into the bucket goes to its bottom, so the top of
-// a bucket is the entry that has been in it the longest.
+// Each bucket has an index and a list of entries ordered by arrival: a key
+// that moves into the bucket goes to its bottom, so the top of a bucket is
+// the entry that has been in it the longest. Buckets are themselves linked
+// to their neighbours in ascending index order.
 type bucket[Key comparable, Value any] struct {
 	index uint64
-	data  *OrderedMap[Key, Value]
+	size  int
+	head  *bucketNode[Key, Value]
+	tail  *bucketNode[Key, Value]
+	prev  *bucket[Key, Value]
+	next  *bucket[Key, Value]
 }
 
 // Structure representing the entire bucket map.
-// Buckets live in an ordered map sorted by index (frequency) in ascending
-// order: the top of the ordered map is the lowest index, the bottom is the
-// highest. A bucket is removed as soon as it becomes empty, so every bucket
-// in the ordered map holds at least one entry.
+// Every key maps straight to its node and every node knows its bucket, so
+// reading a key is one map lookup, and moving it to the next bucket up — what
+// an LFU hit does — needs no further lookup unless a bucket has to be created
+// or dropped. Buckets form a list sorted by index (frequency) in ascending
+// order: the head is the lowest index, the tail the highest. A bucket is
+// removed as soon as it becomes empty, so every bucket in the list holds at
+// least one entry.
 type BucketMap[Key comparable, Value any] struct {
-	buckets *OrderedMap[uint64, *bucket[Key, Value]]
-	mapping map[Key]uint64
+	entries map[Key]*bucketNode[Key, Value]
+	// buckets indexes the linked buckets by index, for the operations that
+	// name an arbitrary bucket. Moving between neighbours never consults it.
+	buckets map[uint64]*bucket[Key, Value]
+	head    *bucket[Key, Value]
+	tail    *bucket[Key, Value]
 	// pool holds warm, empty buckets ready to be linked in, so moving a key
-	// to a new index does not have to allocate a bucket and its inner map.
+	// to a new index does not have to allocate a bucket.
 	// Buckets that empty out go back here until the pool holds poolSize.
 	pool     []*bucket[Key, Value]
 	poolSize int
@@ -60,19 +83,13 @@ var _ BucketMapInterface[int, int] = (*BucketMap[int, int])(nil)
 // constructors for the bucket map.
 
 func newBucket[Key comparable, Value any](index uint64) *bucket[Key, Value] {
-	// The bucket map's lock covers its buckets, so they never lock on their own.
-	return &bucket[Key, Value]{
-		index: index,
-		data:  NewOrderedMap[Key, Value](false),
-	}
+	return &bucket[Key, Value]{index: index}
 }
 
 func NewBucketMap[Key comparable, Value any](locked bool) *BucketMap[Key, Value] {
-	// The bucket map guards every operation with its own lock, so the inner
-	// ordered map never needs to lock on its own.
 	bm := &BucketMap[Key, Value]{
-		buckets: NewOrderedMap[uint64, *bucket[Key, Value]](false),
-		mapping: make(map[Key]uint64),
+		entries: make(map[Key]*bucketNode[Key, Value]),
+		buckets: make(map[uint64]*bucket[Key, Value]),
 		locked:  locked,
 		lock:    sync.RWMutex{},
 	}
@@ -80,15 +97,49 @@ func NewBucketMap[Key comparable, Value any](locked bool) *BucketMap[Key, Value]
 	return bm
 }
 
+// private methods for a single bucket.
+
+// push links n at the bottom of b.
+func (b *bucket[Key, Value]) push(n *bucketNode[Key, Value]) {
+	n.bucket = b
+	n.prev = b.tail
+	n.next = nil
+	if b.tail != nil {
+		b.tail.next = n
+	} else {
+		b.head = n
+	}
+	b.tail = n
+	b.size++
+}
+
+// remove unlinks n from b. The node keeps its key and value.
+func (b *bucket[Key, Value]) remove(n *bucketNode[Key, Value]) {
+	if n.prev != nil {
+		n.prev.next = n.next
+	} else {
+		b.head = n.next
+	}
+	if n.next != nil {
+		n.next.prev = n.prev
+	} else {
+		b.tail = n.prev
+	}
+	n.prev, n.next, n.bucket = nil, nil, nil
+	b.size--
+}
+
+// entry returns the key and value held by n, or zero values for nil.
+func (n *bucketNode[Key, Value]) entry() (Key, Value, bool) {
+	if n == nil {
+		var zeroKey Key
+		var zeroValue Value
+		return zeroKey, zeroValue, false
+	}
+	return n.key, n.value, true
+}
+
 // private methods for interacting with the bucket map.
-
-func (bm *BucketMap[Key, Value]) has_bucket(index uint64) bool {
-	return bm.buckets.Has(index)
-}
-
-func (bm *BucketMap[Key, Value]) bucket_count() int {
-	return bm.buckets.Len()
-}
 
 // warm_up makes sure the pool can hold count buckets and is full.
 func (bm *BucketMap[Key, Value]) warm_up(count int) {
@@ -115,202 +166,236 @@ func (bm *BucketMap[Key, Value]) acquire_bucket(index uint64) *bucket[Key, Value
 // release_bucket returns an unlinked bucket to the pool if there is room.
 func (bm *BucketMap[Key, Value]) release_bucket(b *bucket[Key, Value]) {
 	if len(bm.pool) < bm.poolSize {
-		b.data.Clear()
+		*b = bucket[Key, Value]{}
 		bm.pool = append(bm.pool, b)
 	}
 }
 
-// delete_bucket_if_empty drops the bucket from the ordered map once its last
-// entry is gone, keeping the "no empty buckets" invariant.
-func (bm *BucketMap[Key, Value]) delete_bucket_if_empty(b *bucket[Key, Value]) {
-	if b.data.Len() == 0 {
-		bm.buckets.Delete(b.index)
-		bm.release_bucket(b)
+// link_bucket_after links b into the bucket list right after prev (at the
+// head when prev is nil) and indexes it.
+func (bm *BucketMap[Key, Value]) link_bucket_after(prev *bucket[Key, Value], b *bucket[Key, Value]) {
+	b.prev = prev
+	if prev != nil {
+		b.next = prev.next
+		prev.next = b
+	} else {
+		b.next = bm.head
+		bm.head = b
 	}
+	if b.next != nil {
+		b.next.prev = b
+	} else {
+		bm.tail = b
+	}
+	bm.buckets[b.index] = b
+}
+
+// drop_bucket removes an empty bucket from the list and the index, keeping
+// the "no empty buckets" invariant, and returns it to the pool.
+func (bm *BucketMap[Key, Value]) drop_bucket(b *bucket[Key, Value]) {
+	if b.prev != nil {
+		b.prev.next = b.next
+	} else {
+		bm.head = b.next
+	}
+	if b.next != nil {
+		b.next.prev = b.prev
+	} else {
+		bm.tail = b.prev
+	}
+	delete(bm.buckets, b.index)
+	bm.release_bucket(b)
+}
+
+// insert_bucket creates a bucket for index, which must not have one yet, and
+// links it at its sorted position. near, when not nil, is a linked bucket the
+// search starts from; callers pass the key's current bucket, which for
+// frequency counting is usually adjacent.
+func (bm *BucketMap[Key, Value]) insert_bucket(index uint64, near *bucket[Key, Value]) *bucket[Key, Value] {
+	var prev *bucket[Key, Value]
+	switch {
+	case bm.head == nil || index < bm.head.index:
+		// New lowest bucket: prev stays nil.
+	case index > bm.tail.index:
+		prev = bm.tail
+	default:
+		// head.index < index < tail.index, so both walks stop before
+		// running off either end of the list.
+		prev = near
+		if prev == nil {
+			prev = bm.head
+		}
+		for prev.index > index {
+			prev = prev.prev
+		}
+		for prev.next.index < index {
+			prev = prev.next
+		}
+	}
+	b := bm.acquire_bucket(index)
+	bm.link_bucket_after(prev, b)
+	return b
+}
+
+// bucket_for returns the bucket at index, creating it if needed. near is a
+// linked bucket (or nil) checked, with its neighbours, before the index.
+func (bm *BucketMap[Key, Value]) bucket_for(index uint64, near *bucket[Key, Value]) *bucket[Key, Value] {
+	if near != nil {
+		if near.index == index {
+			return near
+		}
+		if near.next != nil && near.next.index == index {
+			return near.next
+		}
+		if near.prev != nil && near.prev.index == index {
+			return near.prev
+		}
+	}
+	if b, exists := bm.buckets[index]; exists {
+		return b
+	}
+	return bm.insert_bucket(index, near)
+}
+
+// link indexes a detached node under its key and places it at the bottom of
+// the bucket at index. The key must not already be present.
+func (bm *BucketMap[Key, Value]) link(n *bucketNode[Key, Value], index uint64) {
+	bm.bucket_for(index, bm.head).push(n)
+	bm.entries[n.key] = n
+}
+
+// unlink removes n from its bucket and from the index, dropping the bucket if
+// that emptied it. The node keeps its key and value, so it can be reused.
+func (bm *BucketMap[Key, Value]) unlink(n *bucketNode[Key, Value]) {
+	b := n.bucket
+	b.remove(n)
+	delete(bm.entries, n.key)
+	if b.size == 0 {
+		bm.drop_bucket(b)
+	}
+}
+
+// move places n at the bottom of the bucket at index. A node already in that
+// bucket keeps its position.
+func (bm *BucketMap[Key, Value]) move(n *bucketNode[Key, Value], index uint64) {
+	old := n.bucket
+	if old.index == index {
+		return
+	}
+	// The only entry of a bucket can take the bucket along when no other
+	// bucket lies between the two indices: renumbering keeps the list sorted
+	// and saves dropping one bucket and linking another.
+	if old.size == 1 && (old.prev == nil || old.prev.index < index) && (old.next == nil || old.next.index > index) {
+		delete(bm.buckets, old.index)
+		old.index = index
+		bm.buckets[index] = old
+		return
+	}
+	// Find the target before leaving the old bucket, so the old bucket is
+	// still linked to serve as the starting point of the search.
+	target := bm.bucket_for(index, old)
+	old.remove(n)
+	if old.size == 0 {
+		bm.drop_bucket(old)
+	}
+	target.push(n)
+}
+
+// bump records an access to n: it moves to the next bucket up.
+func (bm *BucketMap[Key, Value]) bump(n *bucketNode[Key, Value]) {
+	bm.move(n, n.bucket.index+1)
+}
+
+// end returns the oldest node of the lowest bucket (top) or the newest node
+// of the highest bucket (bottom), or nil when the map is empty.
+func (bm *BucketMap[Key, Value]) end(top bool) *bucketNode[Key, Value] {
+	if top {
+		if bm.head == nil {
+			return nil
+		}
+		return bm.head.head
+	}
+	if bm.tail == nil {
+		return nil
+	}
+	return bm.tail.tail
 }
 
 // clear is Clear without the lock, for callers that already hold it.
 func (bm *BucketMap[Key, Value]) clear() {
-	for _, b, ok := bm.buckets.PopTop(); ok && len(bm.pool) < bm.poolSize; _, b, ok = bm.buckets.PopTop() {
+	for b := bm.head; b != nil && len(bm.pool) < bm.poolSize; {
+		next := b.next
 		bm.release_bucket(b)
+		b = next
 	}
-	bm.buckets.Clear()
-	bm.mapping = make(map[Key]uint64)
-}
-
-// insert_bucket creates a bucket for index and links it into the ordered map
-// at its sorted position. hint, when hasHint is set, is the index of an
-// existing bucket used as the starting point of the search; callers pass the
-// key's previous bucket, which for frequency counting is usually adjacent.
-func (bm *BucketMap[Key, Value]) insert_bucket(index uint64, hint uint64, hasHint bool) *bucket[Key, Value] {
-	b := bm.acquire_bucket(index)
-
-	// If index is smaller than the top index, it should be inserted at the top.
-	topIndex, ok := bm.buckets.TopKey()
-	if !ok || index < topIndex {
-		bm.buckets.SetTop(index, b)
-		return b
-	}
-
-	// If index is larger than the bottom index, it should be inserted at the bottom.
-	bottomIndex, _ := bm.buckets.BottomKey()
-	if index > bottomIndex {
-		bm.buckets.SetBottom(index, b)
-		return b
-	}
-
-	// Otherwise, we need to find the correct position for the new bucket.
-	if hasHint && hint > index && bm.has_bucket(hint) {
-		// Walk upwards from the hint until the previous bucket is smaller.
-		cursor := hint
-		for {
-			prev, ok := bm.buckets.PrevKey(cursor)
-			if !ok || prev < index {
-				break
-			}
-			cursor = prev
-		}
-		bm.buckets.SetBefore(cursor, index, b)
-		return b
-	}
-
-	// Walk downwards from the hint (or the top) until the next bucket is bigger.
-	cursor := topIndex
-	if hasHint && hint < index && bm.has_bucket(hint) {
-		cursor = hint
-	}
-	for {
-		next, ok := bm.buckets.NextKey(cursor)
-		if !ok || next > index {
-			break
-		}
-		cursor = next
-	}
-	bm.buckets.SetAfter(cursor, index, b)
-	return b
+	bm.head, bm.tail = nil, nil
+	bm.entries = make(map[Key]*bucketNode[Key, Value])
+	clear(bm.buckets)
 }
 
 func (bm *BucketMap[Key, Value]) get_all_buckets() []bucket[Key, Value] {
-	buckets := make([]bucket[Key, Value], 0, bm.buckets.Len())
-	for index, ok := bm.buckets.TopKey(); ok; index, ok = bm.buckets.NextKey(index) {
-		b, _ := bm.buckets.Get(index)
+	buckets := make([]bucket[Key, Value], 0, len(bm.buckets))
+	for b := bm.head; b != nil; b = b.next {
 		buckets = append(buckets, *b)
 	}
 	return buckets
 }
 
 func (bm *BucketMap[Key, Value]) get_bucket_indices() []uint64 {
-	indices := make([]uint64, 0, bm.buckets.Len())
-	for index, ok := bm.buckets.TopKey(); ok; index, ok = bm.buckets.NextKey(index) {
-		indices = append(indices, index)
+	indices := make([]uint64, 0, len(bm.buckets))
+	for b := bm.head; b != nil; b = b.next {
+		indices = append(indices, b.index)
 	}
 	return indices
 }
 
+// send_to_bucket stores value for key in the bucket at index. A key already
+// in that bucket keeps its position; one coming from another bucket, or a new
+// one, becomes the newest entry of the bucket.
 func (bm *BucketMap[Key, Value]) send_to_bucket(index uint64, key Key, value Value) {
-	oldIndex, hadOld := bm.mapping[key]
-	if hadOld && oldIndex == index {
-		// Same bucket: update in place, keeping the key's position in it.
-		b, _ := bm.buckets.Get(index)
-		b.data.Update(key, value)
+	if n, exists := bm.entries[key]; exists {
+		n.value = value
+		bm.move(n, index)
 		return
 	}
-
-	b, exists := bm.buckets.Get(index)
-	if !exists {
-		// Insert the new bucket before removing the key from the old one so
-		// the old bucket is still around to serve as a search hint.
-		b = bm.insert_bucket(index, oldIndex, hadOld)
-	}
-	bm.mapping[key] = index
-
-	// A key arriving in a bucket is its newest entry. When it comes from
-	// another bucket its list node moves with it, so the move allocates
-	// nothing.
-	if old, ok := bm.buckets.Get(oldIndex); hadOld && ok {
-		if node := old.data.detach(key); node != nil {
-			node.Value = value
-			b.data.attach_bottom(node)
-			bm.delete_bucket_if_empty(old)
-			return
-		}
-	}
-	b.data.SetBottom(key, value)
+	bm.link(&bucketNode[Key, Value]{key: key, value: value}, index)
 }
 
 // send_to_end places key in the top or bottom bucket, creating bucket 0 when
 // the map is empty.
 func (bm *BucketMap[Key, Value]) send_to_end(key Key, value Value, top bool) {
 	var index uint64
-	var exists bool
-	if top {
-		index, exists = bm.buckets.TopKey()
-	} else {
-		index, exists = bm.buckets.BottomKey()
-	}
-	if !exists {
-		index = 0
+	if top && bm.head != nil {
+		index = bm.head.index
+	} else if !top && bm.tail != nil {
+		index = bm.tail.index
 	}
 	bm.send_to_bucket(index, key, value)
 }
 
 func (bm *BucketMap[Key, Value]) get_entry(key Key) (Value, bool) {
-	if index, exists := bm.mapping[key]; exists {
-		if b, exists := bm.buckets.Get(index); exists {
-			return b.data.Get(key)
-		}
+	if n, exists := bm.entries[key]; exists {
+		return n.value, true
 	}
 	var zero Value
 	return zero, false
 }
 
 func (bm *BucketMap[Key, Value]) pop_entry(key Key) (Value, bool) {
-	if index, exists := bm.mapping[key]; exists {
-		if b, exists := bm.buckets.Get(index); exists {
-			value, ok := b.data.Pop(key)
-			if ok {
-				delete(bm.mapping, key)
-				bm.delete_bucket_if_empty(b)
-				return value, true
-			}
-		}
+	if n, exists := bm.entries[key]; exists {
+		bm.unlink(n)
+		return n.value, true
 	}
 	var zero Value
 	return zero, false
 }
 
-// end_of_bucket returns the oldest (top) or newest (bottom) entry of b.
-func end_of_bucket[Key comparable, Value any](b *bucket[Key, Value], ok bool, top bool) (Key, Value, bool) {
-	if !ok {
-		var zeroKey Key
-		var zeroValue Value
-		return zeroKey, zeroValue, false
+// pop_node removes n (which may be nil) and returns its entry.
+func (bm *BucketMap[Key, Value]) pop_node(n *bucketNode[Key, Value]) (Key, Value, bool) {
+	if n != nil {
+		bm.unlink(n)
 	}
-	if top {
-		return b.data.Top()
-	}
-	return b.data.Bottom()
-}
-
-// pop_end_of_bucket removes and returns the oldest (top) or newest (bottom) entry of b.
-func (bm *BucketMap[Key, Value]) pop_end_of_bucket(b *bucket[Key, Value], ok bool, top bool) (Key, Value, bool) {
-	if !ok {
-		var zeroKey Key
-		var zeroValue Value
-		return zeroKey, zeroValue, false
-	}
-	var key Key
-	var value Value
-	if top {
-		key, value, ok = b.data.PopTop()
-	} else {
-		key, value, ok = b.data.PopBottom()
-	}
-	if ok {
-		delete(bm.mapping, key)
-		bm.delete_bucket_if_empty(b)
-	}
-	return key, value, ok
+	return n.entry()
 }
 
 // public methods for interacting with the bucket map.
@@ -320,7 +405,7 @@ func (bm *BucketMap[Key, Value]) Has(key Key) bool {
 		bm.lock.RLock()
 		defer bm.lock.RUnlock()
 	}
-	_, exists := bm.mapping[key]
+	_, exists := bm.entries[key]
 	return exists
 }
 
@@ -329,7 +414,7 @@ func (bm *BucketMap[Key, Value]) Len() int {
 		bm.lock.RLock()
 		defer bm.lock.RUnlock()
 	}
-	return len(bm.mapping)
+	return len(bm.entries)
 }
 
 func (bm *BucketMap[Key, Value]) Get(key Key) (Value, bool) {
@@ -347,11 +432,11 @@ func (bm *BucketMap[Key, Value]) Update(key Key, value Value) bool {
 		bm.lock.Lock()
 		defer bm.lock.Unlock()
 	}
-	index, exists := bm.mapping[key]
+	n, exists := bm.entries[key]
 	if !exists {
 		return false
 	}
-	bm.send_to_bucket(index, key, value)
+	n.value = value
 	return true
 }
 
@@ -405,8 +490,7 @@ func (bm *BucketMap[Key, Value]) Top() (Key, Value, bool) {
 		bm.lock.RLock()
 		defer bm.lock.RUnlock()
 	}
-	_, b, ok := bm.buckets.Top()
-	return end_of_bucket(b, ok, true)
+	return bm.end(true).entry()
 }
 
 // Bottom returns the newest entry of the bucket with the highest index.
@@ -415,8 +499,7 @@ func (bm *BucketMap[Key, Value]) Bottom() (Key, Value, bool) {
 		bm.lock.RLock()
 		defer bm.lock.RUnlock()
 	}
-	_, b, ok := bm.buckets.Bottom()
-	return end_of_bucket(b, ok, false)
+	return bm.end(false).entry()
 }
 
 // TopKey returns the key of the oldest entry of the bucket with the lowest index.
@@ -437,8 +520,7 @@ func (bm *BucketMap[Key, Value]) PopTop() (Key, Value, bool) {
 		bm.lock.Lock()
 		defer bm.lock.Unlock()
 	}
-	_, b, ok := bm.buckets.Top()
-	return bm.pop_end_of_bucket(b, ok, true)
+	return bm.pop_node(bm.end(true))
 }
 
 // PopBottom removes and returns the newest entry of the bucket with the highest index.
@@ -447,8 +529,7 @@ func (bm *BucketMap[Key, Value]) PopBottom() (Key, Value, bool) {
 		bm.lock.Lock()
 		defer bm.lock.Unlock()
 	}
-	_, b, ok := bm.buckets.Bottom()
-	return bm.pop_end_of_bucket(b, ok, false)
+	return bm.pop_node(bm.end(false))
 }
 
 // GetAnyFromBucket returns the value of the oldest entry in the bucket at index.
@@ -457,9 +538,11 @@ func (bm *BucketMap[Key, Value]) GetAnyFromBucket(index uint64) (Value, bool) {
 		bm.lock.RLock()
 		defer bm.lock.RUnlock()
 	}
-	b, ok := bm.buckets.Get(index)
-	_, value, ok := end_of_bucket(b, ok, true)
-	return value, ok
+	if b, exists := bm.buckets[index]; exists {
+		return b.head.value, true
+	}
+	var zero Value
+	return zero, false
 }
 
 // PopAnyFromBucket removes and returns the value of the oldest entry in the bucket at index.
@@ -468,9 +551,12 @@ func (bm *BucketMap[Key, Value]) PopAnyFromBucket(index uint64) (Value, bool) {
 		bm.lock.Lock()
 		defer bm.lock.Unlock()
 	}
-	b, ok := bm.buckets.Get(index)
-	_, value, ok := bm.pop_end_of_bucket(b, ok, true)
-	return value, ok
+	if b, exists := bm.buckets[index]; exists {
+		_, value, ok := bm.pop_node(b.head)
+		return value, ok
+	}
+	var zero Value
+	return zero, false
 }
 
 // GetBucketIndices returns the bucket indices in ascending order.
@@ -496,7 +582,7 @@ func (bm *BucketMap[Key, Value]) GetBucketCount() int {
 		bm.lock.RLock()
 		defer bm.lock.RUnlock()
 	}
-	return bm.bucket_count()
+	return len(bm.buckets)
 }
 
 // GetBucketIndex returns the index of the bucket that currently holds key.
@@ -505,8 +591,10 @@ func (bm *BucketMap[Key, Value]) GetBucketIndex(key Key) (uint64, bool) {
 		bm.lock.RLock()
 		defer bm.lock.RUnlock()
 	}
-	index, exists := bm.mapping[key]
-	return index, exists
+	if n, exists := bm.entries[key]; exists {
+		return n.bucket.index, true
+	}
+	return 0, false
 }
 
 func (bm *BucketMap[Key, Value]) Clear() {
@@ -545,13 +633,13 @@ func (b bucket[Key, Value]) Index() uint64 {
 }
 
 func (b bucket[Key, Value]) Len() int {
-	return b.data.Len()
+	return b.size
 }
 
 func (b bucket[Key, Value]) Keys() []Key {
-	keys := make([]Key, 0, b.data.Len())
-	for key, ok := b.data.TopKey(); ok; key, ok = b.data.NextKey(key) {
-		keys = append(keys, key)
+	keys := make([]Key, 0, b.size)
+	for n := b.head; n != nil; n = n.next {
+		keys = append(keys, n.key)
 	}
 	return keys
 }
@@ -574,12 +662,9 @@ func (bm *BucketMap[Key, Value]) ToMap() map[Key]Value {
 		bm.lock.RLock()
 		defer bm.lock.RUnlock()
 	}
-	result := make(map[Key]Value, len(bm.mapping))
-	for index, ok := bm.buckets.TopKey(); ok; index, ok = bm.buckets.NextKey(index) {
-		b, _ := bm.buckets.Get(index)
-		for key, value := range b.data.ToMap() {
-			result[key] = value
-		}
+	result := make(map[Key]Value, len(bm.entries))
+	for key, n := range bm.entries {
+		result[key] = n.value
 	}
 	return result
 }
@@ -602,12 +687,10 @@ func (bm *BucketMap[Key, Value]) Snapshot() *BucketMapSnapshot[Key, Value] {
 		bm.lock.RLock()
 		defer bm.lock.RUnlock()
 	}
-	entries := make([]CacheEntry[Key, Value], 0, len(bm.mapping))
-	for index, ok := bm.buckets.TopKey(); ok; index, ok = bm.buckets.NextKey(index) {
-		b, _ := bm.buckets.Get(index)
-		for key, keyOK := b.data.TopKey(); keyOK; key, keyOK = b.data.NextKey(key) {
-			value, _ := b.data.Get(key)
-			entries = append(entries, CacheEntry[Key, Value]{Key: key, Value: value, Frequency: index})
+	entries := make([]CacheEntry[Key, Value], 0, len(bm.entries))
+	for b := bm.head; b != nil; b = b.next {
+		for n := b.head; n != nil; n = n.next {
+			entries = append(entries, CacheEntry[Key, Value]{Key: n.key, Value: n.value, Frequency: b.index})
 		}
 	}
 	return &BucketMapSnapshot[Key, Value]{Entries: entries, Locked: bm.locked}

@@ -151,16 +151,16 @@ func (cm *CacheMap[Key, Value]) has(key Key) bool {
 	return cm.entries.Has(key) && !cm.expired(key)
 }
 
-// touch records an access to an existing key.
-func (cm *CacheMap[Key, Value]) touch(key Key, value Value) {
-	switch cm.eviction {
-	case LRU, MRU:
-		cm.orderedMap.MoveToBottom(key)
-	case LFU, MFU:
-		index, _ := cm.bucketMap.GetBucketIndex(key)
-		cm.bucketMap.Set(index+1, key, value)
-	}
+// The hot paths below (get, set, insert) work on the nodes of the backing
+// map directly instead of going through cm.entries, so each one looks its
+// key up once.
+
+// touch_ordered records an access to a node of the ordered map.
+func (cm *CacheMap[Key, Value]) touch_ordered(n *node[Key, Value]) {
 	// FIFO and LIFO only care about insertion order.
+	if cm.eviction == LRU || cm.eviction == MRU {
+		cm.orderedMap.move_node_to_bottom(n)
+	}
 }
 
 func (cm *CacheMap[Key, Value]) get(key Key) (Value, bool) {
@@ -168,11 +168,17 @@ func (cm *CacheMap[Key, Value]) get(key Key) (Value, bool) {
 		var zero Value
 		return zero, false
 	}
-	value, ok := cm.entries.Get(key)
-	if ok {
-		cm.touch(key, value)
+	if cm.uses_buckets() {
+		if n, ok := cm.bucketMap.entries[key]; ok {
+			cm.bucketMap.bump(n)
+			return n.value, true
+		}
+	} else if n, ok := cm.orderedMap.nodes[key]; ok {
+		cm.touch_ordered(n)
+		return n.Value, true
 	}
-	return value, ok
+	var zero Value
+	return zero, false
 }
 
 // evict removes the entry the policy designates and reports whether one was removed.
@@ -202,22 +208,65 @@ func (cm *CacheMap[Key, Value]) make_room() {
 }
 
 // insert adds a key that is not yet in the cache, evicting first if needed.
+// The node of the last entry evicted is reused for the new one, so an insert
+// into a full cache allocates nothing.
 func (cm *CacheMap[Key, Value]) insert(key Key, value Value) {
-	cm.make_room()
 	if cm.uses_buckets() {
-		cm.bucketMap.Set(1, key, value)
-	} else {
-		cm.orderedMap.SetBottom(key, value)
+		bm := cm.bucketMap
+		var n *bucketNode[Key, Value]
+		for uint64(len(bm.entries)) >= cm.maxCapacity {
+			victim := bm.end(!cm.evicts_bottom())
+			if victim == nil {
+				break
+			}
+			bm.unlink(victim)
+			delete(cm.expiry, victim.key)
+			cm.evicted(victim.key, victim.value)
+			n = victim
+		}
+		if n == nil {
+			n = &bucketNode[Key, Value]{}
+		}
+		n.key, n.value = key, value
+		bm.link(n, 1)
+		return
 	}
+
+	om := cm.orderedMap
+	var n *node[Key, Value]
+	for om.size >= cm.maxCapacity {
+		victim := om.head
+		if cm.evicts_bottom() {
+			victim = om.tail
+		}
+		if victim == nil {
+			break
+		}
+		om.remove_node(victim)
+		delete(cm.expiry, victim.Key)
+		cm.evicted(victim.Key, victim.Value)
+		n = victim
+	}
+	if n == nil {
+		n = &node[Key, Value]{}
+	}
+	n.Key, n.Value = key, value
+	om.insert_node_at_bottom(n)
 }
 
 // set stores value for key. An expired key is replaced as if it were new.
+// Writing an existing key counts as an access.
 func (cm *CacheMap[Key, Value]) set(key Key, value Value) {
 	cm.purge_if_expired(key)
-	if cm.entries.Has(key) {
-		// Writing an existing key counts as an access.
-		cm.entries.Update(key, value)
-		cm.touch(key, value)
+	if cm.uses_buckets() {
+		if n, ok := cm.bucketMap.entries[key]; ok {
+			n.value = value
+			cm.bucketMap.bump(n)
+			return
+		}
+	} else if n, ok := cm.orderedMap.nodes[key]; ok {
+		n.Value = value
+		cm.touch_ordered(n)
 		return
 	}
 	cm.insert(key, value)

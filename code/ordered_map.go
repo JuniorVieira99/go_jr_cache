@@ -134,12 +134,20 @@ func (om *OrderedMap[Key, Value]) link_node_before(anchor *node[Key, Value], nod
 	om.size++
 }
 
+// move_node_to_top and move_node_to_bottom do nothing when the node is
+// already there, which is common for a hot key under a recency policy.
 func (om *OrderedMap[Key, Value]) move_node_to_top(node *node[Key, Value]) {
+	if node == om.head {
+		return
+	}
 	om.unlink_node(node)
 	om.link_node_at_top(node)
 }
 
 func (om *OrderedMap[Key, Value]) move_node_to_bottom(node *node[Key, Value]) {
+	if node == om.tail {
+		return
+	}
 	om.unlink_node(node)
 	om.link_node_at_bottom(node)
 }
@@ -189,26 +197,16 @@ func (om *OrderedMap[Key, Value]) pop_node(node *node[Key, Value]) (Key, Value, 
 	return node.Key, node.Value, true
 }
 
-// detach unlinks key and removes it from the index but keeps the node, so
-// the caller can attach it to another map without allocating. Returns nil
-// if key is absent. Callers must hold the lock (or use an unlocked map).
-func (om *OrderedMap[Key, Value]) detach(key Key) *node[Key, Value] {
-	node, exists := om.nodes[key]
-	if !exists {
-		return nil
-	}
+// remove_node unlinks node and drops it from the index, leaving its key and
+// value in place so the caller can still read them or reuse the node.
+func (om *OrderedMap[Key, Value]) remove_node(node *node[Key, Value]) {
 	om.unlink_node(node)
-	delete(om.nodes, key)
-	return node
+	delete(om.nodes, node.Key)
 }
 
-// attach_bottom links a node obtained from detach at the tail and indexes
-// it. If the node's key is already present, the existing entry is replaced.
-// Callers must hold the lock (or use an unlocked map).
-func (om *OrderedMap[Key, Value]) attach_bottom(node *node[Key, Value]) {
-	if existing, exists := om.nodes[node.Key]; exists {
-		om.unlink_node(existing)
-	}
+// insert_node_at_bottom indexes node under its key and links it at the tail.
+// The key must not already be present.
+func (om *OrderedMap[Key, Value]) insert_node_at_bottom(node *node[Key, Value]) {
 	om.nodes[node.Key] = node
 	om.link_node_at_bottom(node)
 }

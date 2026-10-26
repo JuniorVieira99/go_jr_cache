@@ -80,15 +80,15 @@ policy is the only thing that differs between rows with the same capacity.
 | **jr_cache/CacheMap-LRU** | 74.73 % | 10.00 % |
 | **jr_cache/CacheMap-LFU** | 78.70 % | 9.97 % |
 | **jr_cache/Sharded-LRU** | 74.72 % | 10.00 % |
-| **jr_cache/Sharded-LFU** | 78.69 % | 9.97 % |
+| **jr_cache/Sharded-LFU** | 78.70 % | 9.98 % |
 | **jr_cache/Sharded-LRU-global** | 74.73 % | 10.00 % |
 | hashicorp/golang-lru | 74.73 % | 10.00 % |
 | hashicorp/golang-lru-2Q | 77.79 % | 9.98 % |
-| dgraph-io/ristretto | 77.64 % | 9.98 % |
-| maypok86/otter | 78.75 % | 13.10 % |
-| Yiling-J/theine | 79.63 % | 10.02 % |
+| dgraph-io/ristretto | 77.65 % | 9.95 % |
+| maypok86/otter | 78.50 % | 12.99 % |
+| Yiling-J/theine | 79.60 % | 9.98 % |
 | bluele/gcache-LRU | 74.73 % | 10.00 % |
-| bluele/gcache-LFU | 78.56 % | 9.99 % |
+| bluele/gcache-LFU | 78.53 % | 9.97 % |
 | allegro/bigcache † | 82.85 % | 28.80 % |
 | coocood/freecache † | 73.95 % | 12.75 % |
 
@@ -98,16 +98,16 @@ policy is the only thing that differs between rows with the same capacity.
 |---|---:|---:|
 | **jr_cache/CacheMap-LRU** | 76.96 % | 9.49 % |
 | **jr_cache/CacheMap-LFU** | 77.47 % | 9.48 % |
-| **jr_cache/Sharded-LRU** | 76.95 % | 9.49 % |
-| **jr_cache/Sharded-LFU** | 77.48 % | 9.48 % |
+| **jr_cache/Sharded-LRU** | 76.96 % | 9.49 % |
+| **jr_cache/Sharded-LFU** | 77.47 % | 9.47 % |
 | **jr_cache/Sharded-LRU-global** | 76.96 % | 9.49 % |
 | hashicorp/golang-lru | 76.96 % | 9.49 % |
 | hashicorp/golang-lru-2Q | 77.52 % | 9.47 % |
-| dgraph-io/ristretto | 77.49 % | 9.46 % |
-| maypok86/otter | 76.92 % | 9.48 % |
-| Yiling-J/theine | 77.36 % | 9.47 % |
+| dgraph-io/ristretto | 77.49 % | 9.51 % |
+| maypok86/otter | 76.79 % | 9.51 % |
+| Yiling-J/theine | 77.36 % | 9.46 % |
 | bluele/gcache-LRU | 76.96 % | 9.49 % |
-| bluele/gcache-LFU | 77.38 % | 9.49 % |
+| bluele/gcache-LFU | 77.40 % | 9.49 % |
 | allegro/bigcache † | 73.87 % | 8.15 % |
 | coocood/freecache † | 74.62 % | 9.07 % |
 
@@ -116,7 +116,7 @@ Reading it:
 - Every plain LRU lands on the same number, as it must: `jr_cache` LRU (all
   three variants), golang-lru and gcache-LRU agree to the second decimal.
 - On the skewed trace at 10,000 entries the frequency-aware policies win:
-  theine 79.6 %, `jr_cache` LFU 78.7 %, otter 78.8 %, gcache-LFU 78.6 %,
+  theine 79.6 %, `jr_cache` LFU 78.7 %, otter 78.5 %, gcache-LFU 78.5 %,
   2Q 77.8 %, ristretto 77.6 %, against 74.7 % for LRU. `jr_cache`'s LFU
   (exact counts, LRU tie-break) is within a point of the W-TinyLFU
   implementations at a fraction of their complexity.
@@ -136,196 +136,204 @@ Reading it:
 
 | Library | 10,000 ns/op | 100,000 ns/op | 10,000 allocs | 100,000 allocs | vs jr_cache LRU |
 |---|---:|---:|---:|---:|---:|
-| **jr_cache/CacheMap-LRU** | 34.8 | 39.5 | 0.00 | 0.00 | 1.00× |
-| **jr_cache/CacheMap-LFU** | 102 | 144 | 0.00 | 0.00 | 3.65× |
-| **jr_cache/Sharded-LRU** | 55.6 | 67.5 | 0.00 | 0.00 | 1.71× |
-| **jr_cache/Sharded-LFU** | 168 | 228 | 0.00 | 0.00 | 5.79× |
-| **jr_cache/Sharded-LRU-global** | 85.3 | 114 | 0.00 | 0.00 | 2.88× |
-| hashicorp/golang-lru | 27.6 | 40.3 | 0.00 | 0.00 | 1.02× |
-| hashicorp/golang-lru-2Q | 28.8 | 43.5 | 0.00 | 0.00 | 1.10× |
-| dgraph-io/ristretto | 57.0 | 76.9 | 0.00 | 0.00 | 1.95× |
-| maypok86/otter | 42.5 | 48.6 | 0.00 | 0.00 | 1.23× |
-| Yiling-J/theine | 113 | 146 | 1.00 | 1.00 | 3.71× |
-| bluele/gcache-LRU | 56.0 | 73.5 | 1.00 | 1.00 | 1.86× |
-| bluele/gcache-LFU | 144 | 194 | 1.00 | 1.00 | 4.93× |
-| allegro/bigcache † | 55.7 | 65.1 | 2.00 | 1.00 | 1.65× |
-| coocood/freecache † | 63.2 | 91.9 | 0.00 | 0.00 | 2.33× |
-| patrickmn/go-cache ‡ | 16.0 | 21.4 | 0.00 | 0.00 | 0.54× |
-| orcaman/concurrent-map ‡ | 22.5 | 28.1 | 0.00 | 0.00 | 0.71× |
-| **jr_cache/ShardedMap** ‡ | 28.4 | 34.2 | 0.00 | 0.00 | 0.87× |
+| **jr_cache/CacheMap-LRU** | 30.4 | 32.3 | 0.00 | 0.00 | 1.00× |
+| **jr_cache/CacheMap-LFU** | 30.7 | 35.2 | 0.00 | 0.00 | 1.09× |
+| **jr_cache/Sharded-LRU** | 35.7 | 42.8 | 0.00 | 0.00 | 1.32× |
+| **jr_cache/Sharded-LFU** | 37.0 | 43.4 | 0.00 | 0.00 | 1.34× |
+| **jr_cache/Sharded-LRU-global** | 49.6 | 64.7 | 0.00 | 0.00 | 2.00× |
+| hashicorp/golang-lru | 26.1 | 28.6 | 0.00 | 0.00 | 0.88× |
+| hashicorp/golang-lru-2Q | 25.7 | 30.4 | 0.00 | 0.00 | 0.94× |
+| dgraph-io/ristretto | 34.6 | 48.4 | 0.00 | 0.00 | 1.50× |
+| maypok86/otter | 32.6 | 41.4 | 0.00 | 0.00 | 1.28× |
+| Yiling-J/theine | 82.5 | 107 | 1.00 | 1.00 | 3.32× |
+| bluele/gcache-LRU | 45.2 | 58.4 | 1.00 | 1.00 | 1.81× |
+| bluele/gcache-LFU | 104 | 149 | 1.00 | 1.00 | 4.60× |
+| allegro/bigcache † | 42.9 | 53.2 | 2.00 | 1.00 | 1.65× |
+| coocood/freecache † | 53.0 | 89.0 | 0.00 | 0.00 | 2.75× |
+| patrickmn/go-cache ‡ | 13.4 | 17.5 | 0.00 | 0.00 | 0.54× |
+| orcaman/concurrent-map ‡ | 18.0 | 23.6 | 0.00 | 0.00 | 0.73× |
+| **jr_cache/ShardedMap** ‡ | 18.3 | 25.1 | 0.00 | 0.00 | 0.78× |
 
 ### Get, key absent (1 goroutine)
 
 | Library | 10,000 ns/op | 100,000 ns/op | 10,000 allocs | 100,000 allocs | vs jr_cache LRU |
 |---|---:|---:|---:|---:|---:|
-| **jr_cache/CacheMap-LRU** | 27.4 | 33.7 | 0.00 | 0.00 | 1.00× |
-| **jr_cache/CacheMap-LFU** | 27.5 | 38.6 | 0.00 | 0.00 | 1.14× |
-| **jr_cache/Sharded-LRU** | 39.0 | 53.9 | 0.00 | 0.00 | 1.60× |
-| **jr_cache/Sharded-LFU** | 41.2 | 54.6 | 0.00 | 0.00 | 1.62× |
-| **jr_cache/Sharded-LRU-global** | 37.8 | 49.7 | 0.00 | 0.00 | 1.47× |
-| hashicorp/golang-lru | 25.5 | 33.8 | 0.00 | 0.00 | 1.00× |
-| hashicorp/golang-lru-2Q | 27.8 | 38.1 | 0.00 | 0.00 | 1.13× |
-| dgraph-io/ristretto | 52.8 | 70.3 | 0.00 | 0.00 | 2.09× |
-| maypok86/otter | 13.9 | 15.3 | 0.00 | 0.00 | 0.45× |
-| Yiling-J/theine | 47.2 | 62.0 | 0.00 | 0.00 | 1.84× |
-| bluele/gcache-LRU | 51.8 | 65.8 | 1.00 | 1.00 | 1.95× |
-| bluele/gcache-LFU | 51.2 | 65.2 | 1.00 | 1.00 | 1.93× |
-| allegro/bigcache † | 26.1 | 35.7 | 0.00 | 0.00 | 1.06× |
-| coocood/freecache † | 41.6 | 55.9 | 0.00 | 0.00 | 1.66× |
-| patrickmn/go-cache ‡ | 15.9 | 27.9 | 0.00 | 0.00 | 0.83× |
-| orcaman/concurrent-map ‡ | 24.0 | 39.0 | 0.00 | 0.00 | 1.16× |
-| **jr_cache/ShardedMap** ‡ | 29.1 | 42.1 | 0.00 | 0.00 | 1.25× |
+| **jr_cache/CacheMap-LRU** | 25.4 | 31.9 | 0.00 | 0.00 | 1.00× |
+| **jr_cache/CacheMap-LFU** | 24.6 | 32.1 | 0.00 | 0.00 | 1.01× |
+| **jr_cache/Sharded-LRU** | 30.2 | 41.1 | 0.00 | 0.00 | 1.29× |
+| **jr_cache/Sharded-LFU** | 29.9 | 40.9 | 0.00 | 0.00 | 1.28× |
+| **jr_cache/Sharded-LRU-global** | 26.0 | 34.4 | 0.00 | 0.00 | 1.08× |
+| hashicorp/golang-lru | 23.1 | 29.8 | 0.00 | 0.00 | 0.93× |
+| hashicorp/golang-lru-2Q | 24.5 | 33.2 | 0.00 | 0.00 | 1.04× |
+| dgraph-io/ristretto | 32.5 | 39.1 | 0.00 | 0.00 | 1.23× |
+| maypok86/otter | 8.85 | 11.8 | 0.00 | 0.00 | 0.37× |
+| Yiling-J/theine | 35.1 | 48.4 | 0.00 | 0.00 | 1.52× |
+| bluele/gcache-LRU | 39.8 | 52.0 | 1.00 | 1.00 | 1.63× |
+| bluele/gcache-LFU | 39.5 | 52.2 | 1.00 | 1.00 | 1.63× |
+| allegro/bigcache † | 20.5 | 30.2 | 0.00 | 0.00 | 0.94× |
+| coocood/freecache † | 36.1 | 52.8 | 0.00 | 0.00 | 1.65× |
+| patrickmn/go-cache ‡ | 13.5 | 24.3 | 0.00 | 0.00 | 0.76× |
+| orcaman/concurrent-map ‡ | 19.8 | 33.7 | 0.00 | 0.00 | 1.06× |
+| **jr_cache/ShardedMap** ‡ | 20.8 | 33.8 | 0.00 | 0.00 | 1.06× |
 
 ### Set, key present (1 goroutine)
 
 | Library | 10,000 ns/op | 100,000 ns/op | 10,000 allocs | 100,000 allocs | vs jr_cache LRU |
 |---|---:|---:|---:|---:|---:|
-| **jr_cache/CacheMap-LRU** | 40.8 | 44.9 | 0.00 | 0.00 | 1.00× |
-| **jr_cache/CacheMap-LFU** | 122 | 191 | 0.00 | 0.00 | 4.25× |
-| **jr_cache/Sharded-LRU** | 104 | 139 | 0.00 | 0.00 | 3.10× |
-| **jr_cache/Sharded-LFU** | 218 | 296 | 0.00 | 0.00 | 6.60× |
-| **jr_cache/Sharded-LRU-global** | 104 | 134 | 0.00 | 0.00 | 2.98× |
-| hashicorp/golang-lru | 33.3 | 40.6 | 0.00 | 0.00 | 0.90× |
-| hashicorp/golang-lru-2Q | 37.8 | 46.4 | 0.00 | 0.00 | 1.03× |
-| dgraph-io/ristretto | 224 | 221 | 1.00 | 1.00 | 4.91× |
-| maypok86/otter | 154 | 150 | 1.00 | 1.00 | 3.34× |
-| Yiling-J/theine | 148 | 193 | 0.00 | 0.00 | 4.31× |
-| bluele/gcache-LRU | 58.5 | 77.3 | 1.00 | 1.00 | 1.72× |
-| bluele/gcache-LFU | 56.0 | 72.5 | 1.00 | 1.00 | 1.62× |
-| allegro/bigcache † | 79.9 | 120 | 0.00 | 0.00 | 2.67× |
-| coocood/freecache † | 50.9 | 115 | 0.00 | 0.00 | 2.55× |
-| patrickmn/go-cache ‡ | 35.6 | 46.5 | 0.00 | 0.00 | 1.03× |
-| orcaman/concurrent-map ‡ | 43.9 | 49.6 | 0.00 | 0.00 | 1.10× |
-| **jr_cache/ShardedMap** ‡ | 35.1 | 51.8 | 0.00 | 0.00 | 1.15× |
+| **jr_cache/CacheMap-LRU** | 29.7 | 33.0 | 0.00 | 0.00 | 1.00× |
+| **jr_cache/CacheMap-LFU** | 29.5 | 35.7 | 0.00 | 0.00 | 1.08× |
+| **jr_cache/Sharded-LRU** | 58.5 | 74.8 | 0.00 | 0.00 | 2.27× |
+| **jr_cache/Sharded-LFU** | 60.5 | 83.5 | 0.00 | 0.00 | 2.53× |
+| **jr_cache/Sharded-LRU-global** | 58.0 | 70.8 | 0.00 | 0.00 | 2.15× |
+| hashicorp/golang-lru | 26.4 | 27.8 | 0.00 | 0.00 | 0.84× |
+| hashicorp/golang-lru-2Q | 29.9 | 35.7 | 0.00 | 0.00 | 1.08× |
+| dgraph-io/ristretto | 309 | 344 | 1.00 | 1.00 | 10.42× |
+| maypok86/otter | 172 | 167 | 1.00 | 1.00 | 5.06× |
+| Yiling-J/theine | 178 | 197 | 0.00 | 0.00 | 5.97× |
+| bluele/gcache-LRU | 52.0 | 63.9 | 1.00 | 1.00 | 1.94× |
+| bluele/gcache-LFU | 49.0 | 59.3 | 1.00 | 1.00 | 1.80× |
+| allegro/bigcache † | 61.1 | 94.5 | 0.00 | 0.00 | 2.86× |
+| coocood/freecache † | 42.3 | 112 | 0.00 | 0.00 | 3.40× |
+| patrickmn/go-cache ‡ | 31.2 | 35.0 | 0.00 | 0.00 | 1.06× |
+| orcaman/concurrent-map ‡ | 24.8 | 32.5 | 0.00 | 0.00 | 0.98× |
+| **jr_cache/ShardedMap** ‡ | 28.1 | 33.1 | 0.00 | 0.00 | 1.00× |
 
 ### Set, new key on a full cache — every write evicts (1 goroutine)
 
 | Library | 10,000 ns/op | 100,000 ns/op | 10,000 allocs | 100,000 allocs | vs jr_cache LRU |
 |---|---:|---:|---:|---:|---:|
-| **jr_cache/CacheMap-LRU** | 113 | 92.3 | 1.00 | 1.00 | 1.00× |
-| **jr_cache/CacheMap-LFU** | 196 | 211 | 1.00 | 1.00 | 2.29× |
-| **jr_cache/Sharded-LRU** | 160 | 152 | 1.00 | 1.00 | 1.64× |
-| **jr_cache/Sharded-LFU** | 288 | 290 | 1.00 | 1.00 | 3.14× |
-| **jr_cache/Sharded-LRU-global** | 293 | 299 | 1.00 | 1.00 | 3.24× |
-| hashicorp/golang-lru | 123 | 118 | 1.00 | 1.00 | 1.28× |
-| hashicorp/golang-lru-2Q | 317 | 280 | 2.00 | 2.00 | 3.03× |
-| dgraph-io/ristretto | 137 | 140 | 1.00 | 1.00 | 1.51× |
-| maypok86/otter | 165 | 186 | 1.00 | 1.00 | 2.01× |
-| Yiling-J/theine | 164 | 219 | 0.00 | 0.00 | 2.37× |
-| bluele/gcache-LRU | 181 | 170 | 3.00 | 4.00 | 1.85× |
-| bluele/gcache-LFU | 232 | 383 | 2.00 | 2.00 | 4.15× |
-| allegro/bigcache † | 94.2 | 128 | 0.00 | 0.00 | 1.39× |
-| coocood/freecache † | 97.6 | 132 | 0.00 | 0.00 | 1.43× |
+| **jr_cache/CacheMap-LRU** | 83.6 | 61.5 | 0.00 | 0.00 | 1.00× |
+| **jr_cache/CacheMap-LFU** | 84.5 | 66.1 | 0.00 | 0.00 | 1.08× |
+| **jr_cache/Sharded-LRU** | 90.5 | 82.4 | 0.00 | 0.00 | 1.34× |
+| **jr_cache/Sharded-LFU** | 94.2 | 83.6 | 0.00 | 0.00 | 1.36× |
+| **jr_cache/Sharded-LRU-global** | 179 | 173 | 0.00 | 0.00 | 2.81× |
+| hashicorp/golang-lru | 99.2 | 92.4 | 1.00 | 1.00 | 1.50× |
+| hashicorp/golang-lru-2Q | 244 | 209 | 2.00 | 2.00 | 3.40× |
+| dgraph-io/ristretto | 271 | 204 | 2.00 | 2.00 | 3.33× |
+| maypok86/otter | 191 | 193 | 1.00 | 1.00 | 3.14× |
+| Yiling-J/theine | 247 | 261 | 0.00 | 0.00 | 4.25× |
+| bluele/gcache-LRU | 137 | 135 | 3.00 | 4.00 | 2.19× |
+| bluele/gcache-LFU | 197 | 340 | 2.00 | 2.00 | 5.54× |
+| allegro/bigcache † | 70.2 | 94.0 | 0.00 | 0.00 | 1.53× |
+| coocood/freecache † | 94.0 | 126 | 0.00 | 0.00 | 2.06× |
 
 ### Mixed 90 % Get / 10 % Set, Zipf keys over 2× capacity (1 goroutine)
 
 | Library | 10,000 ns/op | 100,000 ns/op | 10,000 allocs | 100,000 allocs | vs jr_cache LRU |
 |---|---:|---:|---:|---:|---:|
-| **jr_cache/CacheMap-LRU** | 39.4 | 56.3 | 0.00 | 0.00 | 1.00× |
-| **jr_cache/CacheMap-LFU** | 207 | 304 | 0.00 | 0.00 | 5.39× |
-| **jr_cache/Sharded-LRU** | 67.2 | 99.5 | 0.00 | 0.00 | 1.77× |
-| **jr_cache/Sharded-LFU** | 302 | 362 | 0.00 | 0.00 | 6.42× |
-| **jr_cache/Sharded-LRU-global** | 86.5 | 120 | 0.00 | 0.00 | 2.13× |
-| hashicorp/golang-lru | 35.5 | 54.8 | 0.00 | 0.00 | 0.97× |
-| hashicorp/golang-lru-2Q | 42.2 | 67.5 | 0.00 | 0.00 | 1.20× |
-| dgraph-io/ristretto | 72.4 | 89.4 | 0.00 | 0.00 | 1.59× |
-| maypok86/otter | 63.0 | 84.1 | 0.00 | 0.00 | 1.49× |
-| Yiling-J/theine | 131 | 183 | 0.00 | 0.00 | 3.25× |
-| bluele/gcache-LRU | 71.2 | 110 | 1.00 | 1.00 | 1.95× |
-| bluele/gcache-LFU | 137 | 171 | 1.00 | 1.00 | 3.03× |
-| allegro/bigcache † | 66.7 | 77.1 | 1.00 | 1.00 | 1.37× |
-| coocood/freecache † | 75.2 | 98.6 | 0.00 | 0.00 | 1.75× |
-| patrickmn/go-cache ‡ | 20.2 | 38.3 | 0.00 | 0.00 | 0.68× |
-| orcaman/concurrent-map ‡ | 27.5 | 36.5 | 0.00 | 0.00 | 0.65× |
-| **jr_cache/ShardedMap** ‡ | 31.7 | 40.0 | 0.00 | 0.00 | 0.71× |
+| **jr_cache/CacheMap-LRU** | 34.2 | 46.9 | 0.00 | 0.00 | 1.00× |
+| **jr_cache/CacheMap-LFU** | 70.2 | 84.5 | 0.00 | 0.00 | 1.80× |
+| **jr_cache/Sharded-LRU** | 40.0 | 56.8 | 0.00 | 0.00 | 1.21× |
+| **jr_cache/Sharded-LFU** | 84.1 | 102 | 0.00 | 0.00 | 2.19× |
+| **jr_cache/Sharded-LRU-global** | 50.6 | 74.8 | 0.00 | 0.00 | 1.60× |
+| hashicorp/golang-lru | 29.8 | 49.4 | 0.00 | 0.00 | 1.05× |
+| hashicorp/golang-lru-2Q | 33.1 | 57.9 | 0.00 | 0.00 | 1.23× |
+| dgraph-io/ristretto | 59.4 | 87.2 | 0.00 | 0.00 | 1.86× |
+| maypok86/otter | 62.3 | 82.2 | 0.00 | 0.00 | 1.76× |
+| Yiling-J/theine | 128 | 170 | 0.00 | 0.00 | 3.62× |
+| bluele/gcache-LRU | 57.4 | 105 | 1.00 | 1.00 | 2.23× |
+| bluele/gcache-LFU | 118 | 151 | 1.00 | 1.00 | 3.22× |
+| allegro/bigcache † | 48.3 | 66.2 | 1.00 | 1.00 | 1.41× |
+| coocood/freecache † | 65.5 | 93.4 | 0.00 | 0.00 | 1.99× |
+| patrickmn/go-cache ‡ | 17.2 | 33.5 | 0.00 | 0.00 | 0.71× |
+| orcaman/concurrent-map ‡ | 20.5 | 29.4 | 0.00 | 0.00 | 0.63× |
+| **jr_cache/ShardedMap** ‡ | 21.5 | 28.7 | 0.00 | 0.00 | 0.61× |
 
 ### Get, key present, 24 goroutines
 
 | Library | 10,000 ns/op | 100,000 ns/op | 10,000 allocs | 100,000 allocs | vs jr_cache LRU |
 |---|---:|---:|---:|---:|---:|
-| **jr_cache/CacheMap-LRU** | 91.9 | 93.3 | 0.00 | 0.00 | 1.00× |
-| **jr_cache/CacheMap-LFU** | 269 | 312 | 0.00 | 0.00 | 3.34× |
-| **jr_cache/Sharded-LRU** | 41.1 | 45.6 | 0.00 | 0.00 | 0.49× |
-| **jr_cache/Sharded-LFU** | 82.1 | 86.4 | 0.00 | 0.00 | 0.93× |
-| **jr_cache/Sharded-LRU-global** | 147 | 206 | 0.00 | 0.00 | 2.21× |
-| hashicorp/golang-lru | 70.0 | 82.5 | 0.00 | 0.00 | 0.88× |
-| hashicorp/golang-lru-2Q | 69.3 | 84.7 | 0.00 | 0.00 | 0.91× |
-| dgraph-io/ristretto | 6.49 | 7.00 | 0.00 | 0.00 | 0.07× |
-| maypok86/otter | 2.92 | 3.53 | 0.00 | 0.00 | 0.04× |
-| Yiling-J/theine | 4.52 | 4.95 | 0.00 | 0.00 | 0.05× |
-| bluele/gcache-LRU | 86.6 | 110 | 1.00 | 1.00 | 1.18× |
-| bluele/gcache-LFU | 151 | 225 | 1.00 | 1.00 | 2.41× |
-| allegro/bigcache † | 11.6 | 12.3 | 2.00 | 1.00 | 0.13× |
-| coocood/freecache † | 13.4 | 13.7 | 0.00 | 0.00 | 0.15× |
-| patrickmn/go-cache ‡ | 63.2 | 61.6 | 0.00 | 0.00 | 0.66× |
-| orcaman/concurrent-map ‡ | 12.7 | 13.1 | 0.00 | 0.00 | 0.14× |
-| **jr_cache/ShardedMap** ‡ | 15.8 | 15.8 | 0.00 | 0.00 | 0.17× |
+| **jr_cache/CacheMap-LRU** | 99.5 | 89.4 | 0.00 | 0.00 | 1.00× |
+| **jr_cache/CacheMap-LFU** | 88.9 | 90.7 | 0.00 | 0.00 | 1.01× |
+| **jr_cache/Sharded-LRU** | 39.0 | 42.7 | 0.00 | 0.00 | 0.48× |
+| **jr_cache/Sharded-LFU** | 33.5 | 36.1 | 0.00 | 0.00 | 0.40× |
+| **jr_cache/Sharded-LRU-global** | 164 | 231 | 0.00 | 0.00 | 2.59× |
+| hashicorp/golang-lru | 90.0 | 96.3 | 0.00 | 0.00 | 1.08× |
+| hashicorp/golang-lru-2Q | 93.9 | 89.1 | 0.00 | 0.00 | 1.00× |
+| dgraph-io/ristretto | 5.05 | 5.70 | 0.00 | 0.00 | 0.06× |
+| maypok86/otter | 3.32 | 3.68 | 0.00 | 0.00 | 0.04× |
+| Yiling-J/theine | 4.01 | 4.78 | 0.00 | 0.00 | 0.05× |
+| bluele/gcache-LRU | 196 | 218 | 1.00 | 1.00 | 2.44× |
+| bluele/gcache-LFU | 253 | 321 | 1.00 | 1.00 | 3.59× |
+| allegro/bigcache † | 11.4 | 12.1 | 2.00 | 1.00 | 0.13× |
+| coocood/freecache † | 12.7 | 13.7 | 0.00 | 0.00 | 0.15× |
+| patrickmn/go-cache ‡ | 62.4 | 68.2 | 0.00 | 0.00 | 0.76× |
+| orcaman/concurrent-map ‡ | 8.31 | 9.01 | 0.00 | 0.00 | 0.10× |
+| **jr_cache/ShardedMap** ‡ | 19.3 | 13.7 | 0.00 | 0.00 | 0.15× |
 
 ### Mixed 90 % Get / 10 % Set, Zipf keys, 24 goroutines
 
 | Library | 10,000 ns/op | 100,000 ns/op | 10,000 allocs | 100,000 allocs | vs jr_cache LRU |
 |---|---:|---:|---:|---:|---:|
-| **jr_cache/CacheMap-LRU** | 106 | 119 | 0.00 | 0.00 | 1.00× |
-| **jr_cache/CacheMap-LFU** | 379 | 409 | 0.00 | 0.00 | 3.44× |
-| **jr_cache/Sharded-LRU** | 60.4 | 60.3 | 0.00 | 0.00 | 0.51× |
-| **jr_cache/Sharded-LFU** | 176 | 192 | 0.00 | 0.00 | 1.62× |
-| **jr_cache/Sharded-LRU-global** | 172 | 214 | 0.00 | 0.00 | 1.80× |
-| hashicorp/golang-lru | 97.4 | 110 | 0.00 | 0.00 | 0.93× |
-| hashicorp/golang-lru-2Q | 103 | 122 | 0.00 | 0.00 | 1.03× |
-| dgraph-io/ristretto | 49.9 | 42.7 | 0.00 | 0.00 | 0.36× |
-| maypok86/otter | 26.8 | 32.7 | 0.00 | 0.00 | 0.28× |
-| Yiling-J/theine | 48.0 | 46.2 | 0.00 | 0.00 | 0.39× |
-| bluele/gcache-LRU | 139 | 155 | 1.00 | 1.00 | 1.31× |
-| bluele/gcache-LFU | 200 | 219 | 1.00 | 1.00 | 1.84× |
-| allegro/bigcache † | 63.8 | 63.1 | 1.00 | 1.00 | 0.53× |
-| coocood/freecache † | 30.0 | 25.8 | 0.00 | 0.00 | 0.22× |
-| patrickmn/go-cache ‡ | 112 | 140 | 0.00 | 0.00 | 1.18× |
-| orcaman/concurrent-map ‡ | 41.2 | 41.1 | 0.00 | 0.00 | 0.35× |
-| **jr_cache/ShardedMap** ‡ | 55.9 | 54.0 | 0.00 | 0.00 | 0.45× |
+| **jr_cache/CacheMap-LRU** | 104 | 115 | 0.00 | 0.00 | 1.00× |
+| **jr_cache/CacheMap-LFU** | 152 | 166 | 0.00 | 0.00 | 1.45× |
+| **jr_cache/Sharded-LRU** | 63.9 | 66.4 | 0.00 | 0.00 | 0.58× |
+| **jr_cache/Sharded-LFU** | 77.2 | 72.4 | 0.00 | 0.00 | 0.63× |
+| **jr_cache/Sharded-LRU-global** | 215 | 264 | 0.00 | 0.00 | 2.31× |
+| hashicorp/golang-lru | 116 | 130 | 0.00 | 0.00 | 1.14× |
+| hashicorp/golang-lru-2Q | 141 | 138 | 0.00 | 0.00 | 1.21× |
+| dgraph-io/ristretto | 50.6 | 43.7 | 0.00 | 0.00 | 0.38× |
+| maypok86/otter | 27.0 | 29.6 | 0.00 | 0.00 | 0.26× |
+| Yiling-J/theine | 50.5 | 44.2 | 0.00 | 0.00 | 0.39× |
+| bluele/gcache-LRU | 217 | 252 | 1.00 | 1.00 | 2.20× |
+| bluele/gcache-LFU | 298 | 327 | 1.00 | 1.00 | 2.86× |
+| allegro/bigcache † | 70.8 | 66.3 | 1.00 | 1.00 | 0.58× |
+| coocood/freecache † | 33.2 | 27.9 | 0.00 | 0.00 | 0.24× |
+| patrickmn/go-cache ‡ | 138 | 169 | 0.00 | 0.00 | 1.48× |
+| orcaman/concurrent-map ‡ | 49.2 | 47.3 | 0.00 | 0.00 | 0.41× |
+| **jr_cache/ShardedMap** ‡ | 65.5 | 62.5 | 0.00 | 0.00 | 0.55× |
 
 ## What the numbers say
 
 **Single-threaded, `jr_cache` LRU is as fast as the fastest bounded
-cache.** Its `Get` (35–40 ns), `Set` (41–45 ns) and mixed Zipf loop
-(39–56 ns) are within a few nanoseconds of hashicorp/golang-lru, and ahead
-of every other bounded library: ristretto, otter and theine pay 1.5–3.5×
+cache.** Its `Get` (30–32 ns), `Set` (30–33 ns) and mixed Zipf loop
+(34–47 ns) are within a few nanoseconds of hashicorp/golang-lru, and ahead
+of every other bounded library: ristretto, otter and theine pay 1.3–10×
 for their buffers and admission filters when there is no contention to
-amortise them against. Eviction (`SetEvict`, 92–113 ns) is likewise the
-cheapest of the bounded group.
+amortise them against. Eviction (`SetEvict`, 61–84 ns) allocates nothing —
+the evicted entry's node is reused for the new one — and is the cheapest
+of the bounded group at 100,000 entries; at 10,000 only bigcache (70 ns)
+is faster.
 
 **Under contention the picture splits in two.** With 24 goroutines
-reading, `jr_cache`'s sharded LRU (41–46 ns) beats every *mutex-based*
-cache — golang-lru (70–83 ns), gcache, go-cache — and the single locked
-`CacheMap` (92 ns). But the caches that record accesses without a lock are
-in another class: otter serves a parallel hit in 3 ns, theine in 4.5 ns,
-ristretto in 6.5 ns, bigcache/freecache/concurrent-map in 12–14 ns. The
-reason is structural: every `jr_cache` cache `Get` takes the shard's
-**write** lock so it can move the entry in the LRU list or bump its
-frequency bucket. Sharding divides that contention by 16; the lock-free
-designs remove it. On the mixed parallel workload the gap narrows (otter
-27–33 ns, ristretto/theine 43–50 ns, `jr_cache` sharded LRU 60 ns) because
-writes force the other libraries to touch their policies too.
+reading, `jr_cache`'s sharded caches (34–43 ns) beat every *mutex-based*
+cache — golang-lru (90–96 ns), gcache, go-cache — and the single locked
+`CacheMap` (89–99 ns). But the caches that record accesses without a lock
+are in another class: otter serves a parallel hit in 3.3–3.7 ns, theine in
+4–5 ns, ristretto in 5–6 ns, concurrent-map in 8–9 ns and
+bigcache/freecache in 11–14 ns. The reason is structural: every `jr_cache`
+cache `Get` takes the shard's **write** lock so it can move the entry in
+the LRU list or bump its frequency bucket. Sharding divides that contention
+by 16; the lock-free designs remove it. On the mixed parallel workload the
+gap narrows (otter 27–30 ns, ristretto/theine 44–51 ns, `jr_cache` sharded
+LRU 64–66 ns, sharded LFU 72–77 ns) because writes force the other
+libraries to touch their policies too.
 
-**`jr_cache`'s LFU is the expensive one.** Exact LFU moves the entry to a
-new frequency bucket on every hit; with string keys that is 100–145 ns per
-`Get` single-threaded and 3–5× LRU on the mixed loops. It buys a hit ratio
-on par with W-TinyLFU, but the frequency-sketch designs get that hit ratio
-for ~1.5× LRU cost instead. If you want frequency-aware eviction *and*
-speed, `jr_cache` LFU is the wrong tool and theine/otter are the right one.
+**`jr_cache`'s LFU now costs about what its LRU costs.** Exact LFU moves
+the entry to the next frequency bucket on every hit. The buckets are a
+sorted linked list and every node points at its bucket, so that move is a
+few pointer writes after a single hash lookup: 31–35 ns per `Get` with
+string keys (LRU 30–32 ns), 70–85 ns on the mixed Zipf loop, and 34–36 ns
+per parallel hit on the sharded cache. That is a hit ratio on par with
+W-TinyLFU at LRU cost single-threaded — faster than otter (33–41 ns) and
+theine (83–107 ns) on a `Get`, and level with otter on the mixed loop.
+Under heavy read contention on one hot cache the lock-free designs are
+still an order of magnitude ahead.
 
-**Global order costs what it says.** `Sharded-LRU-global` is 2–3× the
+**Global order costs what it says.** `Sharded-LRU-global` is 1.2–2.8× the
 per-shard variant on every row, and slower than the plain locked `CacheMap`
-under contention (172–214 vs 106–119 ns), since each call takes the index
+under contention (164–264 vs 89–115 ns), since each call takes the index
 lock and a shard lock. It exists for exact eviction and O(1) `Top`/`Len`,
 not for speed.
 
 **As a plain concurrent map, `jr_cache/ShardedMap` is competitive.**
-16–29 ns single-threaded reads and 16 ns parallel reads, against
-concurrent-map's 22–28 / 13 ns — the difference is `maphash` on the key
+18–25 ns single-threaded reads and 14–19 ns parallel reads, against
+concurrent-map's 18–24 / 8–9 ns — the difference is `maphash` on the key
 versus concurrent-map's fnv32. Nothing here allocates.
 
-**Allocations.** `jr_cache` allocates nothing on any hit or overwrite and
-one node per inserted key. gcache allocates on every call (`interface{}`
+**Allocations.** `jr_cache` allocates nothing on any hit, any overwrite,
+or any insert that evicts; only an insert into a cache that still has room
+allocates (one node). gcache allocates on every call (`interface{}`
 boxing), theine on every hit, bigcache on every read (the returned slice).
 
 ## Feature comparison
